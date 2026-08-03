@@ -34,6 +34,12 @@ async fn main() -> anyhow::Result<()> {
     let config = ResolvedConfig::from_args(args)?;
 
     info!("Starting sshtun for target: {} ({}:{})", config.host, config.hostname, config.port);
+    if !config.jump_hosts.is_empty() {
+        info!("Jump hosts configured: {}", config.jump_hosts.len());
+        for (i, j) in config.jump_hosts.iter().enumerate() {
+            info!("  Jump host [{}]: {} ({}:{} as user '{}')", i + 1, j.host, j.hostname, j.port, j.user);
+        }
+    }
     if let Some(ref tun) = config.tun_forward {
         info!("TUN tunnel requested: local '{}' <-> remote '{}'", tun.local_tun, tun.remote_tun);
     }
@@ -44,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
     loop {
         info!("Attempting SSH connection to {}:{}...", config.hostname, config.port);
 
-        match SshConnection::connect(&config.hostname, config.port, &config.user, &config.identity_files).await {
+        match SshConnection::connect(&config).await {
             Ok(mut ssh_conn) => {
                 info!("SSH connection established successfully to {}:{}", config.hostname, config.port);
 
