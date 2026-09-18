@@ -10,7 +10,7 @@ use ssh::SshConnection;
 use std::time::Duration;
 use tokio::signal;
 use tokio::time::sleep;
-use tracing::{error, info, Level};
+use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 use tunnels::TunnelManager;
 
@@ -88,13 +88,47 @@ async fn main() -> anyhow::Result<()> {
                     }
                     _ = signal::ctrl_c() => {
                         info!("Received Ctrl+C / SIGINT signal. Terminating sshtun...");
+                        monitor_handle.abort();
                         tunnel_mgr.abort_all();
+
+                        if let Some(ref tun) = config.tun_forward {
+                            if tun.auto_id.is_some() {
+                                info!("Cleaning up remote server rules... (Press Ctrl+C again to force exit)");
+                                let cleanup_handle = ssh_conn.handle.clone();
+                                let cleanup_config = config.clone();
+                                tokio::select! {
+                                    res = tokio::time::timeout(
+                                        Duration::from_secs(4),
+                                        hooks::run_cleanup_hooks(&cleanup_handle, &cleanup_config)
+                                    ) => {
+                                        if res.is_err() {
+                                            warn!("Remote cleanup timed out after 4 seconds.");
+                                        }
+                                    }
+                                    _ = signal::ctrl_c() => {
+                                        warn!("Second Ctrl+C received. Force exiting immediately.");
+                                        std::process::exit(130);
+                                    }
+                                }
+                            }
+                        }
                         return Ok(());
                     }
                 }
 
                 info!("Connection lost. Cleaning up active tunnels...");
                 tunnel_mgr.abort_all();
+
+                if let Some(ref tun) = config.tun_forward {
+                    if tun.auto_id.is_some() {
+                        let cleanup_handle = ssh_conn.handle.clone();
+                        let cleanup_config = config.clone();
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(2),
+                            hooks::run_cleanup_hooks(&cleanup_handle, &cleanup_config)
+                        ).await;
+                    }
+                }
             }
             Err(e) => {
                 error!("SSH connection error: {}", e);

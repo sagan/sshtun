@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Result};
 use std::fs::File;
 use std::io::BufReader;
+use sha2::{Digest, Sha256};
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "sshtun", author, version, about = "Pure Rust SSH tunnel manager with TUN support and auto-reconnect")]
@@ -30,8 +31,8 @@ pub struct CliArgs {
     #[arg(short = 'D', long = "dynamic-forward")]
     pub dynamic_forwards: Vec<String>,
 
-    /// TUN device tunnel: local_tun[:remote_tun] (e.g. 0:0, any:any, tun0:tun1)
-    #[arg(short = 'w', long = "tun-forward")]
+    /// TUN device tunnel: local_tun[:remote_tun] (e.g. 0:0, any:any, tun0:tun1) or "auto"
+    #[arg(short = 'w', long = "tun-forward", num_args = 0..=1, default_missing_value = "auto")]
     pub tun_forward: Option<String>,
 
     /// Jump host(s): [user@]host[:port][,...]
@@ -110,6 +111,7 @@ pub struct DynamicForwardSpec {
 pub struct TunForwardSpec {
     pub local_tun: String,
     pub remote_tun: String,
+    pub auto_id: Option<u16>,
 }
 
 #[derive(Debug, Clone)]
@@ -269,28 +271,113 @@ pub fn parse_dynamic_forward(spec: &str) -> Result<DynamicForwardSpec> {
 }
 
 pub fn parse_tun_forward(spec: &str) -> Result<TunForwardSpec> {
-    let tokens: Vec<&str> = spec.split_whitespace().collect();
+    let trimmed = spec.trim();
+    if trimmed == "auto" {
+        return Ok(TunForwardSpec {
+            local_tun: "auto".to_string(),
+            remote_tun: "auto".to_string(),
+            auto_id: None,
+        });
+    }
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
     if tokens.len() == 1 {
-        let parts: Vec<&str> = spec.split(':').collect();
+        let parts: Vec<&str> = trimmed.split(':').collect();
         match parts.len() {
             1 => Ok(TunForwardSpec {
                 local_tun: parts[0].to_string(),
                 remote_tun: parts[0].to_string(),
+                auto_id: None,
             }),
             2 => Ok(TunForwardSpec {
                 local_tun: parts[0].to_string(),
                 remote_tun: parts[1].to_string(),
+                auto_id: None,
             }),
-            _ => Err(anyhow!("Invalid TUN spec '{}', expected local_tun[:remote_tun]", spec)),
+            _ => Err(anyhow!("Invalid TUN spec '{}', expected local_tun[:remote_tun] or 'auto'", spec)),
         }
     } else if tokens.len() == 2 {
         Ok(TunForwardSpec {
             local_tun: tokens[0].to_string(),
             remote_tun: tokens[1].to_string(),
+            auto_id: None,
         })
     } else {
         Err(anyhow!("Invalid TUN spec '{}'", spec))
     }
+}
+
+fn get_local_device_info() -> String {
+    if let Ok(id) = std::fs::read_to_string("/etc/machine-id") {
+        let trimmed = id.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    if let Ok(id) = std::fs::read_to_string("/var/lib/dbus/machine-id") {
+        let trimmed = id.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    if let Ok(host) = std::fs::read_to_string("/etc/hostname") {
+        let trimmed = host.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    if let Ok(host) = std::env::var("HOSTNAME") {
+        let trimmed = host.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    std::env::var("USER").unwrap_or_else(|_| "localhost".to_string())
+}
+
+fn get_local_network_info() -> String {
+    if let Ok(content) = std::fs::read_to_string("/proc/net/route") {
+        for line in content.lines().skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() >= 3 && fields[1] == "00000000" {
+                let iface = fields[0];
+                let gateway = fields[2];
+                let mac = std::fs::read_to_string(format!("/sys/class/net/{}/address", iface))
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                return format!("{}:{}:{}", iface, gateway, mac);
+            }
+        }
+    }
+    String::new()
+}
+
+pub fn generate_auto_tun_id(host: &str, port: u16) -> (u16, String, String) {
+    let device_info = get_local_device_info();
+    let network_info = get_local_network_info();
+
+    let mut hasher = Sha256::new();
+    hasher.update(host.as_bytes());
+    hasher.update(b":");
+    hasher.update(port.to_string().as_bytes());
+    hasher.update(b"|");
+    hasher.update(device_info.as_bytes());
+    hasher.update(b"|");
+    hasher.update(network_info.as_bytes());
+    let hash = hasher.finalize();
+
+    let raw_id = u16::from_be_bytes([hash[0], hash[1]]);
+    // Safe link-local bounds (RFC 3927: 169.254.0.0/16 excluding 0.x and 255.x)
+    // 254 * 127 = 32258 disjoint pairs
+    let pair_idx = (raw_id as u32) % (254 * 127);
+    let x = ((pair_idx / 127) + 1) as u16; // 1..=254
+    let y = (((pair_idx % 127) * 2) + 1) as u16; // 1, 3, 5, ..., 253 (odd)
+    let id = (x << 8) | y; // 16-bit number: lower bits of local IP will be exactly id
+
+    let local_ip = format!("169.254.{}.{}", id >> 8, id & 0xff);
+    let remote_ip = format!("169.254.{}.{}", (id + 1) >> 8, (id + 1) & 0xff);
+
+    (id, local_ip, remote_ip)
 }
 
 #[derive(Debug, Default, Clone)]
@@ -663,13 +750,32 @@ impl ResolvedConfig {
         }
 
         // TUN forward (CLI flag overrides config)
-        let tun_forward = if let Some(ref spec) = args.tun_forward {
+        let mut tun_forward = if let Some(ref spec) = args.tun_forward {
             Some(parse_tun_forward(spec)?)
         } else if let Some(ref spec) = extracted.tun_forward {
             Some(parse_tun_forward(spec)?)
         } else {
             None
         };
+
+        let mut local_tun_addr = args.local_tun_addr;
+        let mut remote_tun_addr = args.remote_tun_addr;
+
+        if let Some(ref mut tun) = tun_forward {
+            if tun.local_tun == "auto" || tun.remote_tun == "auto" {
+                let (id, auto_local_ip, auto_remote_ip) = generate_auto_tun_id(&target_config.host, target_config.port);
+                tun.local_tun = format!("tun{}", id);
+                tun.remote_tun = format!("tun{}", id);
+                tun.auto_id = Some(id);
+
+                if local_tun_addr.is_none() {
+                    local_tun_addr = Some(auto_local_ip);
+                }
+                if remote_tun_addr.is_none() {
+                    remote_tun_addr = Some(auto_remote_ip);
+                }
+            }
+        }
 
         Ok(ResolvedConfig {
             host: target_config.host,
@@ -682,8 +788,8 @@ impl ResolvedConfig {
             remote_forwards,
             dynamic_forwards,
             tun_forward,
-            local_tun_addr: args.local_tun_addr,
-            remote_tun_addr: args.remote_tun_addr,
+            local_tun_addr,
+            remote_tun_addr,
             local_post_up: args.local_post_up,
             remote_post_up: args.remote_post_up,
             reconnect_interval: args.reconnect_interval,
@@ -820,6 +926,7 @@ mod tests {
             TunForwardSpec {
                 local_tun: "0".to_string(),
                 remote_tun: "0".to_string(),
+                auto_id: None,
             }
         );
 
@@ -829,6 +936,7 @@ mod tests {
             TunForwardSpec {
                 local_tun: "any".to_string(),
                 remote_tun: "any".to_string(),
+                auto_id: None,
             }
         );
 
@@ -838,8 +946,37 @@ mod tests {
             TunForwardSpec {
                 local_tun: "tun0".to_string(),
                 remote_tun: "tun1".to_string(),
+                auto_id: None,
             }
         );
+
+        let t4 = parse_tun_forward("auto").unwrap();
+        assert_eq!(
+            t4,
+            TunForwardSpec {
+                local_tun: "auto".to_string(),
+                remote_tun: "auto".to_string(),
+                auto_id: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_auto_tun_id_and_ip() {
+        let (id1, local_ip1, remote_ip1) = generate_auto_tun_id("example.com", 22);
+        let (id2, local_ip2, remote_ip2) = generate_auto_tun_id("example.com", 22);
+        assert_eq!(id1, id2);
+        assert_eq!(local_ip1, local_ip2);
+        assert_eq!(remote_ip1, remote_ip2);
+
+        // Check bounds & lower 16 bits match
+        assert!(id1 >= 256 && id1 <= 65278);
+        let local_lower = (local_ip1.split('.').nth(2).unwrap().parse::<u16>().unwrap() << 8)
+            | local_ip1.split('.').nth(3).unwrap().parse::<u16>().unwrap();
+        let remote_lower = (remote_ip1.split('.').nth(2).unwrap().parse::<u16>().unwrap() << 8)
+            | remote_ip1.split('.').nth(3).unwrap().parse::<u16>().unwrap();
+        assert_eq!(local_lower, id1);
+        assert_eq!(remote_lower, id1 + 1);
     }
 
     #[test]
@@ -872,6 +1009,35 @@ Host myserver
         assert_eq!(extracted.dynamic_forwards, vec!["1080"]);
         assert_eq!(extracted.tun_forward, Some("0:0".to_string()));
         assert_eq!(extracted.proxy_jump, Some("jump1.example.com:2222, jump2.example.com".to_string()));
+    }
+
+    #[test]
+    fn test_cli_args_tun_auto() {
+        // -w without value should default to "auto"
+        let args1 = CliArgs::try_parse_from(["sshtun", "myserver", "-w"]).unwrap();
+        assert_eq!(args1.tun_forward, Some("auto".to_string()));
+
+        // -w with explicit auto
+        let args2 = CliArgs::try_parse_from(["sshtun", "myserver", "-w", "auto"]).unwrap();
+        assert_eq!(args2.tun_forward, Some("auto".to_string()));
+
+        // -w with custom spec
+        let args3 = CliArgs::try_parse_from(["sshtun", "myserver", "-w", "0:0"]).unwrap();
+        assert_eq!(args3.tun_forward, Some("0:0".to_string()));
+
+        // without -w
+        let args4 = CliArgs::try_parse_from(["sshtun", "myserver"]).unwrap();
+        assert_eq!(args4.tun_forward, None);
+
+        // ResolvedConfig with auto
+        let resolved = ResolvedConfig::from_args(args1).unwrap();
+        let tun = resolved.tun_forward.unwrap();
+        assert!(tun.auto_id.is_some());
+        let id = tun.auto_id.unwrap();
+        assert_eq!(tun.local_tun, format!("tun{}", id));
+        assert_eq!(tun.remote_tun, format!("tun{}", id));
+        assert!(resolved.local_tun_addr.is_some());
+        assert!(resolved.remote_tun_addr.is_some());
     }
 }
 

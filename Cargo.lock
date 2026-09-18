@@ -1624,6 +1624,7 @@ dependencies = [
  "nix",
  "russh",
  "russh-keys",
+ "sha2",
  "ssh2-config",
  "tempfile",
  "tokio",
