@@ -15,11 +15,11 @@
   - **Local Port Forwarding (`-L`)**: `[bind_address:]port:host:hostport`
   - **Remote Port Forwarding (`-R`)**: `[bind_address:]port:host:hostport`
   - **Dynamic SOCKS5 Proxy (`-D`)**: `[bind_address:]port`
-  - **TUN Interface Tunneling (`-w`)**: `local_tun[:remote_tun]` (e.g. `0:0`, `any:any`, `tun0:tun1`).
+  - **TUN Interface Tunneling (`-w`)**: `local_tun[:remote_tun]` (e.g. `0:0`, `any:any`, `tun0:tun1`), or `-w auto` for zero-configuration automatic TUN setup.
 - **Automated TUN Device & Network Setup**:
+  - Automatically provisions TUN interfaces with `-w auto` (deriving stable `<id>` and link-local IP addresses, configuring server nftables firewall and routing out of the box).
   - Configures point-to-point /32 IP address pairs on local TUN interfaces via `--local-tun-addr` and `--remote-tun-addr`.
-  - Automatically provisions remote TUN interfaces over the SSH channel.
-  - Supports `--local-post-up <cmdline>` and `--remote-post-up <cmdline>` hook scripts for routing, firewall rules, and custom network setup upon connection establishment.
+  - Supports `--local-post-up <cmdline>` and `--remote-post-up <cmdline>` hook scripts with `%i` interface name placeholder (e.g. `ip route add ... dev %i`) for custom routing and firewall rules.
 - **Link Supervision & Auto-Reconnect**:
   - Built-in keepalive ping health monitor (`keepalive@openssh.com`).
   - Automatically tears down stale tunnels and reconnects upon link failure.
@@ -111,15 +111,22 @@ Start a local SOCKS5 proxy on `127.0.0.1:1080`:
 sshtun my-ssh-alias -D 1080
 ```
 
-### 3. Layer-3 TUN Tunnel with Auto IP Configuration
+### 3. Layer-3 TUN Tunnel with Auto Setup & Custom Routing
 
-Create point-to-point TUN interfaces (`tun0` locally and remotely), assign IP addresses `192.168.100.1` and `192.168.100.2`, and run post-up routing commands:
+With `-w auto` (or simply `-w`), `sshtun` automatically provisions TUN interfaces with derived link-local IPs and configures remote nftables forwarding. You can use `%i` as a placeholder for the dynamically created TUN interface in `--local-post-up` or `--remote-post-up`:
+
+```bash
+sudo sshtun root@remote-server -w \
+  --local-post-up "ip route add 10.3.1.0/24 dev %i table 5"
+```
+
+Or configure manually:
 
 ```bash
 sudo sshtun root@remote-server -w 0:0 \
   --local-tun-addr 192.168.100.1 \
   --remote-tun-addr 192.168.100.2 \
-  --local-post-up "ip route add 10.0.0.0/24 via 192.168.100.2" \
+  --local-post-up "ip route add 10.0.0.0/24 dev %i via 192.168.100.2" \
   --remote-post-up "iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE"
 ```
 

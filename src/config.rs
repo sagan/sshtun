@@ -47,11 +47,11 @@ pub struct CliArgs {
     #[arg(long = "remote-tun-addr")]
     pub remote_tun_addr: Option<String>,
 
-    /// Shell command executed locally after tunnel is established
+    /// Shell command executed locally after tunnel is established (supports '%i' for TUN interface name)
     #[arg(long = "local-post-up")]
     pub local_post_up: Option<String>,
 
-    /// Shell command executed on remote server after tunnel is established
+    /// Shell command executed on remote server after tunnel is established (supports '%i' for TUN interface name)
     #[arg(long = "remote-post-up")]
     pub remote_post_up: Option<String>,
 

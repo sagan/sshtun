@@ -117,9 +117,32 @@ pub async fn run_post_up_hooks(
         }
     }
 
+    // Determine local and remote TUN interface names if TUN is configured
+    let (local_tun_name, remote_tun_name) = match config.tun_forward {
+        Some(ref tun) => {
+            let local_name = if tun.local_tun == "any" {
+                "tun0".to_string()
+            } else if tun.local_tun.starts_with("tun") {
+                tun.local_tun.clone()
+            } else {
+                format!("tun{}", tun.local_tun)
+            };
+            let remote_name = if tun.remote_tun == "any" {
+                "tun0".to_string()
+            } else if tun.remote_tun.starts_with("tun") {
+                tun.remote_tun.clone()
+            } else {
+                format!("tun{}", tun.remote_tun)
+            };
+            (Some(local_name), Some(remote_name))
+        }
+        None => (None, None),
+    };
+
     // Run explicit remote-post-up if provided
     if let Some(ref remote_cmd) = config.remote_post_up {
-        match run_remote_command(handle, remote_cmd).await {
+        let cmd_expanded = expand_hook_cmd(remote_cmd, remote_tun_name.as_deref());
+        match run_remote_command(handle, &cmd_expanded).await {
             Ok(out) => {
                 info!("Remote post-up output: {}", out.trim());
             }
@@ -131,12 +154,21 @@ pub async fn run_post_up_hooks(
 
     // Run explicit local-post-up if provided
     if let Some(ref local_cmd) = config.local_post_up {
-        if let Err(e) = run_local_post_up(local_cmd).await {
+        let cmd_expanded = expand_hook_cmd(local_cmd, local_tun_name.as_deref());
+        if let Err(e) = run_local_post_up(&cmd_expanded).await {
             error!("Local post-up hook error: {}", e);
         }
     }
 
     Ok(())
+}
+
+pub fn expand_hook_cmd(cmd: &str, iface: Option<&str>) -> String {
+    if let Some(name) = iface {
+        cmd.replace("%i", name)
+    } else {
+        cmd.to_string()
+    }
 }
 
 pub async fn run_cleanup_hooks(
@@ -173,4 +205,29 @@ pub async fn run_cleanup_hooks(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_expand_hook_cmd() {
+        let cmd = "ip route add 10.3.1.0/24 dev %i table 5";
+        assert_eq!(
+            expand_hook_cmd(cmd, Some("tun28799")),
+            "ip route add 10.3.1.0/24 dev tun28799 table 5"
+        );
+
+        let multi = "ip link set %i up && ip route add 10.0.0.0/8 dev %i";
+        assert_eq!(
+            expand_hook_cmd(multi, Some("tun0")),
+            "ip link set tun0 up && ip route add 10.0.0.0/8 dev tun0"
+        );
+
+        assert_eq!(
+            expand_hook_cmd(cmd, None),
+            "ip route add 10.3.1.0/24 dev %i table 5"
+        );
+    }
 }
