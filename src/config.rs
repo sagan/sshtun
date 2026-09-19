@@ -31,7 +31,7 @@ pub struct CliArgs {
     #[arg(short = 'D', long = "dynamic-forward")]
     pub dynamic_forwards: Vec<String>,
 
-    /// TUN device tunnel: local_tun[:remote_tun] (e.g. 0:0, any:any, tun0:tun1) or "auto"
+    /// TUN device tunnel: local_tun[:remote_tun] (e.g. 0:0, any:any, tun0:tun1) or "auto" / "auto:<id>"
     #[arg(short = 'w', long = "tun-forward", num_args = 0..=1, default_missing_value = "auto")]
     pub tun_forward: Option<String>,
 
@@ -277,6 +277,17 @@ pub fn parse_tun_forward(spec: &str) -> Result<TunForwardSpec> {
             local_tun: "auto".to_string(),
             remote_tun: "auto".to_string(),
             auto_id: None,
+        });
+    }
+    if let Some(id_str) = trimmed.strip_prefix("auto:") {
+        let id = id_str
+            .trim()
+            .parse::<u16>()
+            .map_err(|e| anyhow!("Invalid auto TUN id '{}': {}", id_str, e))?;
+        return Ok(TunForwardSpec {
+            local_tun: format!("tun2222{}", id),
+            remote_tun: format!("tun2222{}", id),
+            auto_id: Some(id),
         });
     }
     let tokens: Vec<&str> = trimmed.split_whitespace().collect();
@@ -764,8 +775,8 @@ impl ResolvedConfig {
         if let Some(ref mut tun) = tun_forward {
             if tun.local_tun == "auto" || tun.remote_tun == "auto" {
                 let (id, auto_local_ip, auto_remote_ip) = generate_auto_tun_id(&target_config.host, target_config.port);
-                tun.local_tun = format!("tun{}", id);
-                tun.remote_tun = format!("tun{}", id);
+                tun.local_tun = format!("tun2222{}", id);
+                tun.remote_tun = format!("tun2222{}", id);
                 tun.auto_id = Some(id);
 
                 if local_tun_addr.is_none() {
@@ -773,6 +784,13 @@ impl ResolvedConfig {
                 }
                 if remote_tun_addr.is_none() {
                     remote_tun_addr = Some(auto_remote_ip);
+                }
+            } else if let Some(id) = tun.auto_id {
+                if local_tun_addr.is_none() {
+                    local_tun_addr = Some(format!("169.254.{}.{}", id >> 8, id & 0xff));
+                }
+                if remote_tun_addr.is_none() {
+                    remote_tun_addr = Some(format!("169.254.{}.{}", (id + 1) >> 8, (id + 1) & 0xff));
                 }
             }
         }
@@ -959,6 +977,16 @@ mod tests {
                 auto_id: None,
             }
         );
+
+        let t5 = parse_tun_forward("auto:1024").unwrap();
+        assert_eq!(
+            t5,
+            TunForwardSpec {
+                local_tun: "tun22221024".to_string(),
+                remote_tun: "tun22221024".to_string(),
+                auto_id: Some(1024),
+            }
+        );
     }
 
     #[test]
@@ -1034,10 +1062,21 @@ Host myserver
         let tun = resolved.tun_forward.unwrap();
         assert!(tun.auto_id.is_some());
         let id = tun.auto_id.unwrap();
-        assert_eq!(tun.local_tun, format!("tun{}", id));
-        assert_eq!(tun.remote_tun, format!("tun{}", id));
+        assert_eq!(tun.local_tun, format!("tun2222{}", id));
+        assert_eq!(tun.remote_tun, format!("tun2222{}", id));
         assert!(resolved.local_tun_addr.is_some());
         assert!(resolved.remote_tun_addr.is_some());
+
+        // -w with explicit auto:1024
+        let args_auto_id = CliArgs::try_parse_from(["sshtun", "myserver", "-w", "auto:1024"]).unwrap();
+        assert_eq!(args_auto_id.tun_forward, Some("auto:1024".to_string()));
+        let resolved_auto_id = ResolvedConfig::from_args(args_auto_id).unwrap();
+        let tun_auto_id = resolved_auto_id.tun_forward.unwrap();
+        assert_eq!(tun_auto_id.auto_id, Some(1024));
+        assert_eq!(tun_auto_id.local_tun, "tun22221024");
+        assert_eq!(tun_auto_id.remote_tun, "tun22221024");
+        assert_eq!(resolved_auto_id.local_tun_addr, Some("169.254.4.0".to_string()));
+        assert_eq!(resolved_auto_id.remote_tun_addr, Some("169.254.4.1".to_string()));
     }
 }
 

@@ -15,9 +15,9 @@
   - **Local Port Forwarding (`-L`)**: `[bind_address:]port:host:hostport`
   - **Remote Port Forwarding (`-R`)**: `[bind_address:]port:host:hostport`
   - **Dynamic SOCKS5 Proxy (`-D`)**: `[bind_address:]port`
-  - **TUN Interface Tunneling (`-w`)**: `local_tun[:remote_tun]` (e.g. `0:0`, `any:any`, `tun0:tun1`), or `-w auto` for zero-configuration automatic TUN setup.
+  - **TUN Interface Tunneling (`-w`)**: `local_tun[:remote_tun]` (e.g. `0:0`, `any:any`, `tun0:tun1`), or `-w auto` / `-w auto:<id>` for zero-configuration automatic TUN setup.
 - **Automated TUN Device & Network Setup**:
-  - Automatically provisions TUN interfaces with `-w auto` (deriving stable `<id>` and link-local IP addresses, configuring server nftables firewall and routing out of the box).
+  - Automatically provisions TUN interfaces `tun2222<id>` with `-w auto` (or `-w auto:<id>`) with derived or assigned `<id>` and link-local IP addresses, configuring server nftables firewall and routing out of the box.
   - Configures point-to-point /32 IP address pairs on local TUN interfaces via `--local-tun-addr` and `--remote-tun-addr`.
   - Supports `--local-post-up <cmdline>` and `--remote-post-up <cmdline>` hook scripts with `%i` interface name placeholder (e.g. `ip route add ... dev %i`) for custom routing and firewall rules.
 - **Link Supervision & Auto-Reconnect**:
@@ -113,10 +113,15 @@ sshtun my-ssh-alias -D 1080
 
 ### 3. Layer-3 TUN Tunnel with Auto Setup & Custom Routing
 
-With `-w auto` (or simply `-w`), `sshtun` automatically provisions TUN interfaces with derived link-local IPs and configures remote nftables forwarding. You can use `%i` as a placeholder for the dynamically created TUN interface in `--local-post-up` or `--remote-post-up`:
+With `-w auto` (or `-w auto:<id>`, e.g. `-w auto:1024`), `sshtun` automatically provisions TUN interfaces named `tun2222<id>` with derived or assigned link-local IPs and configures remote nftables forwarding. You can use `%i` as a placeholder for the dynamically created TUN interface in `--local-post-up` or `--remote-post-up`:
 
 ```bash
+# Auto-generate ID & IPs, creating tun2222<id>
 sudo sshtun root@remote-server -w \
+  --local-post-up "ip route add 10.3.1.0/24 dev %i table 5"
+
+# Or manually set ID (creates tun22221024 with 169.254.4.0 <-> 169.254.4.1):
+sudo sshtun root@remote-server -w auto:1024 \
   --local-post-up "ip route add 10.3.1.0/24 dev %i table 5"
 ```
 

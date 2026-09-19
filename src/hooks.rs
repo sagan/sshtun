@@ -7,11 +7,7 @@ use tracing::{error, info, warn};
 
 pub async fn run_local_post_up(cmd: &str) -> anyhow::Result<()> {
     info!("Running local post-up command: '{}'", cmd);
-    let status = LocalCommand::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .status()
-        .await?;
+    let status = LocalCommand::new("sh").arg("-c").arg(cmd).status().await?;
 
     if status.success() {
         info!("Local post-up command completed successfully");
@@ -28,7 +24,6 @@ pub async fn run_remote_command(
     info!("Executing remote command via SSH: '{}'", cmd);
     let channel = handle
         .channel_open_session()
-
         .await
         .map_err(|e| anyhow::anyhow!("Failed to open remote session channel: {}", e))?;
 
@@ -50,9 +45,11 @@ pub async fn run_post_up_hooks(
 ) -> anyhow::Result<()> {
     if let Some(ref tun) = config.tun_forward {
         if let Some(id) = tun.auto_id {
-            if let (Some(ref remote_ip), Some(ref local_ip)) = (&config.remote_tun_addr, &config.local_tun_addr) {
+            if let (Some(ref remote_ip), Some(ref local_ip)) =
+                (&config.remote_tun_addr, &config.local_tun_addr)
+            {
                 let fwmark = (id as u32) << 16;
-                let tun_dev = format!("tun{}", id);
+                let tun_dev = format!("tun2222{}", id);
                 let remote_ip_clean = remote_ip.trim_end_matches("/32");
                 let local_ip_clean = local_ip.trim_end_matches("/32");
 
@@ -62,9 +59,9 @@ pub async fn run_post_up_hooks(
                      ip addr add {remote_ip}/32 peer {local_ip} dev {tun_dev} 2>/dev/null || true; \
                      ip link set dev {tun_dev} up 2>/dev/null || true; \
                      nft 'add table inet sshtun{id}; delete table inet sshtun{id}; table inet sshtun{id} {{ chain prerouting {{ type filter hook prerouting priority mangle; policy accept; iifname \"{tun_dev}\" ct state new ct mark set {fwmark}; iifname != \"{tun_dev}\" ct mark {fwmark} meta mark set ct mark; }}; chain output {{ type route hook output priority mangle; policy accept; ct mark {fwmark} meta mark set ct mark; }}; chain postrouting {{ type nat hook postrouting priority srcnat; policy accept; oifname != \"{tun_dev}\" ip saddr {local_ip} masquerade; }}; }}'; \
-                     ip rule del fwmark {fwmark}/0xffff0000 lookup {id} 2>/dev/null || true; \
-                     ip rule add fwmark {fwmark}/0xffff0000 lookup {id} prio 10000; \
-                     ip route replace default dev {tun_dev} table {id}",
+                     ip rule del fwmark {fwmark}/0xffff0000 lookup 2222{id} 2>/dev/null || true; \
+                     ip rule add fwmark {fwmark}/0xffff0000 lookup 2222{id} prio 5; \
+                     ip route replace default dev {tun_dev} table 2222{id}",
                     tun_dev = tun_dev,
                     id = id,
                     fwmark = fwmark,
@@ -87,7 +84,9 @@ pub async fn run_post_up_hooks(
                     }
                 }
             }
-        } else if let (Some(ref remote_ip), Some(ref local_ip)) = (&config.remote_tun_addr, &config.local_tun_addr) {
+        } else if let (Some(ref remote_ip), Some(ref local_ip)) =
+            (&config.remote_tun_addr, &config.local_tun_addr)
+        {
             let remote_tun_name = if tun.remote_tun != "any" {
                 if tun.remote_tun.starts_with("tun") {
                     tun.remote_tun.clone()
@@ -105,7 +104,10 @@ pub async fn run_post_up_hooks(
                 remote_tun_name,
                 remote_tun_name
             );
-            info!("Configuring remote TUN interface via SSH: {}", auto_remote_cmd);
+            info!(
+                "Configuring remote TUN interface via SSH: {}",
+                auto_remote_cmd
+            );
             match run_remote_command(handle, &auto_remote_cmd).await {
                 Ok(out) => {
                     info!("Remote TUN IP setup output: {}", out.trim());
@@ -178,7 +180,7 @@ pub async fn run_cleanup_hooks(
     if let Some(ref tun) = config.tun_forward {
         if let Some(id) = tun.auto_id {
             let fwmark = (id as u32) << 16;
-            let tun_dev = format!("tun{}", id);
+            let tun_dev = format!("tun2222{}", id);
             let cleanup_cmd = format!(
                 "nft 'add table inet sshtun{id}; delete table inet sshtun{id}' 2>/dev/null || true; \
                  ip rule del fwmark {fwmark}/0xffff0000 lookup {id} 2>/dev/null || true; \
