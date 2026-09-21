@@ -18,6 +18,8 @@ pub async fn setup_tun_forward(
     spec: &TunForwardSpec,
     local_tun_addr: Option<&str>,
     remote_tun_addr: Option<&str>,
+    local_tun_addr6: Option<&str>,
+    remote_tun_addr6: Option<&str>,
 ) -> anyhow::Result<(TunSession, String)> {
     let dev_name = if spec.local_tun == "any" {
         "tun0".to_string()
@@ -56,7 +58,7 @@ pub async fn setup_tun_forward(
     let actual_dev_name = tun.name().to_string();
     info!("Local TUN device '{}' created successfully", actual_dev_name);
 
-    // Configure local TUN IP address if provided
+    // Configure local TUN IPv4 address if provided
     if let (Some(local_ip), Some(remote_ip)) = (local_tun_addr, remote_tun_addr) {
         info!(
             "Configuring local TUN device {} with address {} peer {}",
@@ -102,6 +104,63 @@ pub async fn setup_tun_forward(
             }
             Err(e) => {
                 error!("Failed to execute ip addr command for local TUN: {}", e);
+            }
+        }
+
+        let _ = Command::new("ip")
+            .args(&["link", "set", &actual_dev_name, "up"])
+            .status()
+            .await;
+    }
+
+    // Configure local TUN IPv6 address if provided
+    if let (Some(local_ip6), Some(remote_ip6)) = (local_tun_addr6, remote_tun_addr6) {
+        info!(
+            "Configuring local TUN device {} with IPv6 address {} peer {}",
+            actual_dev_name, local_ip6, remote_ip6
+        );
+        let local_clean = local_ip6.trim_end_matches("/127").trim_end_matches("/128");
+        let remote_clean = remote_ip6.trim_end_matches("/127").trim_end_matches("/128");
+        let status = Command::new("ip")
+            .args(&[
+                "addr",
+                "replace",
+                &format!("{}/127", local_clean),
+                "peer",
+                remote_clean,
+                "dev",
+                &actual_dev_name,
+            ])
+            .status()
+            .await;
+
+        let status = match status {
+            Ok(s) if s.success() => Ok(s),
+            _ => {
+                Command::new("ip")
+                    .args(&[
+                        "addr",
+                        "add",
+                        &format!("{}/127", local_clean),
+                        "peer",
+                        remote_clean,
+                        "dev",
+                        &actual_dev_name,
+                    ])
+                    .status()
+                    .await
+            }
+        };
+
+        match status {
+            Ok(s) if s.success() => {
+                info!("Configured IPv6 address on local TUN device {}", actual_dev_name);
+            }
+            Ok(s) => {
+                warn!("ip addr command returned exit status for IPv6: {}", s);
+            }
+            Err(e) => {
+                error!("Failed to execute ip addr command for local TUN IPv6: {}", e);
             }
         }
 

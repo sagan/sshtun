@@ -71,6 +71,10 @@ Options:
           Local TUN IP address (e.g. 192.168.100.1 or 192.168.100.1/32)
       --remote-tun-addr <REMOTE_TUN_ADDR>
           Remote TUN IP address (e.g. 192.168.100.2 or 192.168.100.2/32)
+      --local-tun-addr6 <LOCAL_TUN_ADDR6>
+          Local TUN IPv6 address (e.g. fd00::1 or fd00::1/127)
+      --remote-tun-addr6 <REMOTE_TUN_ADDR6>
+          Remote TUN IPv6 address (e.g. fd00::2 or fd00::2/127)
       --local-post-up <LOCAL_POST_UP>
           Shell command executed locally after tunnel is established
       --remote-post-up <REMOTE_POST_UP>
@@ -113,14 +117,14 @@ sshtun my-ssh-alias -D 1080
 
 ### 3. Layer-3 TUN Tunnel with Auto Setup & Custom Routing
 
-With `-w auto` (or `-w auto:<id>`, e.g. `-w auto:1024`), `sshtun` automatically provisions TUN interfaces named `tun2222<id>` with derived or assigned link-local IPs and configures remote nftables forwarding. You can use `%i` as a placeholder for the dynamically created TUN interface in `--local-post-up` or `--remote-post-up`:
+With `-w auto` (or `-w auto:<id>`, e.g. `-w auto:1024`), `sshtun` automatically provisions TUN interfaces named `tun2222<id>` with dual-stack IPv4 (`169.254.0.0/16`) and IPv6 ULA (`fd00::/8` /127 subnet derived from `<id>`) addresses, and configures remote nftables forwarding and masquerading. You can use `%i` as a placeholder for the dynamically created TUN interface in `--local-post-up` or `--remote-post-up`:
 
 ```bash
-# Auto-generate ID & IPs, creating tun2222<id>
+# Auto-generate ID & dual-stack IPv4/IPv6 IPs, creating tun2222<id>
 sudo sshtun root@remote-server -w \
   --local-post-up "ip route add 10.3.1.0/24 dev %i table 5"
 
-# Or manually set ID (creates tun22221024 with 169.254.4.0 <-> 169.254.4.1):
+# Or manually set ID (creates tun22221024 with 169.254.4.0 <-> 169.254.4.1 and fd..:0 <-> fd..:1):
 sudo sshtun root@remote-server -w auto:1024 \
   --local-post-up "ip route add 10.3.1.0/24 dev %i table 5"
 ```

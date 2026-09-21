@@ -78,6 +78,8 @@ impl TunnelManager {
             let tun_spec = tun_spec.clone();
             let local_ip = config.local_tun_addr.clone();
             let remote_ip = config.remote_tun_addr.clone();
+            let local_ip6 = config.local_tun_addr6.clone();
+            let remote_ip6 = config.remote_tun_addr6.clone();
             let tx = exit_tx.clone();
 
             // Synchronous setup: create local TUN, configure address, open remote SSH TUN channel
@@ -86,6 +88,8 @@ impl TunnelManager {
                 &tun_spec,
                 local_ip.as_deref(),
                 remote_ip.as_deref(),
+                local_ip6.as_deref(),
+                remote_ip6.as_deref(),
             ).await?;
             tracing::info!("TUN interface '{}' ready for packet forwarding", dev_name);
 

@@ -53,12 +53,39 @@ pub async fn run_post_up_hooks(
                 let remote_ip_clean = remote_ip.trim_end_matches("/32");
                 let local_ip_clean = local_ip.trim_end_matches("/32");
 
+                let mut ipv6_cmds = String::new();
+                let mut nft_v6_masq = String::new();
+                if let (Some(ref remote_ip6), Some(ref local_ip6)) =
+                    (&config.remote_tun_addr6, &config.local_tun_addr6)
+                {
+                    let remote_ip6_clean = remote_ip6.trim_end_matches("/127").trim_end_matches("/128");
+                    let local_ip6_clean = local_ip6.trim_end_matches("/127").trim_end_matches("/128");
+                    ipv6_cmds = format!(
+                        "sysctl -w net.ipv6.conf.all.forwarding=1 2>/dev/null || true; \
+                         ip addr replace {remote_ip6}/127 peer {local_ip6} dev {tun_dev} 2>/dev/null || ip addr add {remote_ip6}/127 peer {local_ip6} dev {tun_dev} 2>/dev/null || true; \
+                         ip -6 rule del fwmark {fwmark}/0xffff0000 lookup 2222{id} 2>/dev/null || true; \
+                         ip -6 rule add fwmark {fwmark}/0xffff0000 lookup 2222{id} prio 5; \
+                         ip -6 route replace default dev {tun_dev} table 2222{id}; ",
+                        remote_ip6 = remote_ip6_clean,
+                        local_ip6 = local_ip6_clean,
+                        tun_dev = tun_dev,
+                        fwmark = fwmark,
+                        id = id,
+                    );
+                    nft_v6_masq = format!(
+                        "oifname != \"{tun_dev}\" ip6 saddr {local_ip6} masquerade; ",
+                        tun_dev = tun_dev,
+                        local_ip6 = local_ip6_clean,
+                    );
+                }
+
                 let auto_setup_cmd = format!(
                     "for i in $(seq 1 50); do if ip link show dev {tun_dev} >/dev/null 2>&1; then break; fi; sleep 0.1; done; \
                      sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true; \
                      ip addr replace {remote_ip}/32 peer {local_ip} dev {tun_dev} 2>/dev/null || ip addr add {remote_ip}/32 peer {local_ip} dev {tun_dev} 2>/dev/null || true; \
                      ip link set dev {tun_dev} up 2>/dev/null || true; \
-                     nft 'add table inet sshtun{id}; delete table inet sshtun{id}; table inet sshtun{id} {{ chain prerouting {{ type filter hook prerouting priority mangle; policy accept; iifname \"{tun_dev}\" ct state new ct mark set {fwmark}; iifname != \"{tun_dev}\" ct mark {fwmark} meta mark set ct mark; }}; chain output {{ type route hook output priority mangle; policy accept; ct mark {fwmark} meta mark set ct mark; }}; chain postrouting {{ type nat hook postrouting priority srcnat; policy accept; oifname != \"{tun_dev}\" ip saddr {local_ip} masquerade; }}; }}'; \
+                     {ipv6_cmds}\
+                     nft 'add table inet sshtun{id}; delete table inet sshtun{id}; table inet sshtun{id} {{ chain prerouting {{ type filter hook prerouting priority mangle; policy accept; iifname \"{tun_dev}\" ct state new ct mark set {fwmark}; iifname != \"{tun_dev}\" ct mark {fwmark} meta mark set ct mark; }}; chain output {{ type route hook output priority mangle; policy accept; ct mark {fwmark} meta mark set ct mark; }}; chain postrouting {{ type nat hook postrouting priority srcnat; policy accept; oifname != \"{tun_dev}\" ip saddr {local_ip} masquerade; {nft_v6_masq}}}; }}'; \
                      ip rule del fwmark {fwmark}/0xffff0000 lookup 2222{id} 2>/dev/null || true; \
                      ip rule add fwmark {fwmark}/0xffff0000 lookup 2222{id} prio 5; \
                      ip route replace default dev {tun_dev} table 2222{id}",
@@ -67,6 +94,8 @@ pub async fn run_post_up_hooks(
                     fwmark = fwmark,
                     remote_ip = remote_ip_clean,
                     local_ip = local_ip_clean,
+                    ipv6_cmds = ipv6_cmds,
+                    nft_v6_masq = nft_v6_masq,
                 );
 
                 info!("Configuring auto TUN routing and firewall rules on remote server ({tun_dev})...");
@@ -97,14 +126,28 @@ pub async fn run_post_up_hooks(
                 "tun0".to_string()
             };
 
+            let ipv6_addr_cmd = if let (Some(ref remote_ip6), Some(ref local_ip6)) =
+                (&config.remote_tun_addr6, &config.local_tun_addr6)
+            {
+                let remote_clean = remote_ip6.trim_end_matches("/127").trim_end_matches("/128");
+                let local_clean = local_ip6.trim_end_matches("/127").trim_end_matches("/128");
+                format!(
+                    "; ip addr replace {}/127 peer {} dev {} 2>/dev/null || ip addr add {}/127 peer {} dev {} 2>/dev/null || true",
+                    remote_clean, local_clean, remote_tun_name, remote_clean, local_clean, remote_tun_name
+                )
+            } else {
+                String::new()
+            };
+
             let auto_remote_cmd = format!(
-                "ip addr replace {}/32 peer {} dev {} 2>/dev/null || ip addr add {}/32 peer {} dev {} 2>/dev/null || true; ip link set {} up",
+                "ip addr replace {}/32 peer {} dev {} 2>/dev/null || ip addr add {}/32 peer {} dev {} 2>/dev/null || true{}; ip link set {} up",
                 remote_ip.trim_end_matches("/32"),
                 local_ip.trim_end_matches("/32"),
                 remote_tun_name,
                 remote_ip.trim_end_matches("/32"),
                 local_ip.trim_end_matches("/32"),
                 remote_tun_name,
+                ipv6_addr_cmd,
                 remote_tun_name
             );
             info!(
@@ -188,8 +231,12 @@ pub async fn run_cleanup_hooks(
                 "nft 'add table inet sshtun{id}; delete table inet sshtun{id}' 2>/dev/null || true; \
                  ip rule del fwmark {fwmark}/0xffff0000 lookup 2222{id} 2>/dev/null || true; \
                  ip rule del fwmark {fwmark}/0xffff0000 lookup {id} 2>/dev/null || true; \
+                 ip -6 rule del fwmark {fwmark}/0xffff0000 lookup 2222{id} 2>/dev/null || true; \
+                 ip -6 rule del fwmark {fwmark}/0xffff0000 lookup {id} 2>/dev/null || true; \
                  ip route del default dev {tun_dev} table 2222{id} 2>/dev/null || true; \
                  ip route del default dev {tun_dev} table {id} 2>/dev/null || true; \
+                 ip -6 route del default dev {tun_dev} table 2222{id} 2>/dev/null || true; \
+                 ip -6 route del default dev {tun_dev} table {id} 2>/dev/null || true; \
                  ip link set dev {tun_dev} down 2>/dev/null || true; \
                  ip link delete dev {tun_dev} 2>/dev/null || true",
                 id = id,

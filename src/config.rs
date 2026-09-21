@@ -47,6 +47,14 @@ pub struct CliArgs {
     #[arg(long = "remote-tun-addr")]
     pub remote_tun_addr: Option<String>,
 
+    /// Local TUN IPv6 address (e.g. fd00::1 or fd00::1/127)
+    #[arg(long = "local-tun-addr6")]
+    pub local_tun_addr6: Option<String>,
+
+    /// Remote TUN IPv6 address (e.g. fd00::2 or fd00::2/127)
+    #[arg(long = "remote-tun-addr6")]
+    pub remote_tun_addr6: Option<String>,
+
     /// Shell command executed locally after tunnel is established (supports '%i' for TUN interface name)
     #[arg(long = "local-post-up")]
     pub local_post_up: Option<String>,
@@ -128,6 +136,8 @@ pub struct ResolvedConfig {
     pub tun_forward: Option<TunForwardSpec>,
     pub local_tun_addr: Option<String>,
     pub remote_tun_addr: Option<String>,
+    pub local_tun_addr6: Option<String>,
+    pub remote_tun_addr6: Option<String>,
     pub local_post_up: Option<String>,
     pub remote_post_up: Option<String>,
     pub reconnect_interval: u64,
@@ -389,6 +399,25 @@ pub fn generate_auto_tun_id(host: &str, port: u16) -> (u16, String, String) {
     let remote_ip = format!("169.254.{}.{}", (id + 1) >> 8, (id + 1) & 0xff);
 
     (id, local_ip, remote_ip)
+}
+
+pub fn derive_auto_tun_ipv6(id: u16) -> (String, String) {
+    let mut hasher = Sha256::new();
+    hasher.update(id.to_be_bytes());
+    let hash = hasher.finalize();
+
+    let mut local_bytes = [0u8; 16];
+    local_bytes[0] = 0xfd; // IPv6 ULA fd00::/8 prefix
+    local_bytes[1..15].copy_from_slice(&hash[0..14]); // 112 bits from hash
+    local_bytes[15] = hash[14] & 0xfe; // high 7 bits from hash (112 + 7 = 119 subnet bits); bit 0 is 0 for local
+
+    let mut remote_bytes = local_bytes;
+    remote_bytes[15] |= 1; // bit 0 is 1 for remote
+
+    (
+        std::net::Ipv6Addr::from(local_bytes).to_string(),
+        std::net::Ipv6Addr::from(remote_bytes).to_string(),
+    )
 }
 
 #[derive(Debug, Default, Clone)]
@@ -771,6 +800,8 @@ impl ResolvedConfig {
 
         let mut local_tun_addr = args.local_tun_addr;
         let mut remote_tun_addr = args.remote_tun_addr;
+        let mut local_tun_addr6 = args.local_tun_addr6;
+        let mut remote_tun_addr6 = args.remote_tun_addr6;
 
         if let Some(ref mut tun) = tun_forward {
             if tun.local_tun == "auto" || tun.remote_tun == "auto" {
@@ -785,12 +816,30 @@ impl ResolvedConfig {
                 if remote_tun_addr.is_none() {
                     remote_tun_addr = Some(auto_remote_ip);
                 }
+                if local_tun_addr6.is_none() || remote_tun_addr6.is_none() {
+                    let (auto_local_ip6, auto_remote_ip6) = derive_auto_tun_ipv6(id);
+                    if local_tun_addr6.is_none() {
+                        local_tun_addr6 = Some(auto_local_ip6);
+                    }
+                    if remote_tun_addr6.is_none() {
+                        remote_tun_addr6 = Some(auto_remote_ip6);
+                    }
+                }
             } else if let Some(id) = tun.auto_id {
                 if local_tun_addr.is_none() {
                     local_tun_addr = Some(format!("169.254.{}.{}", id >> 8, id & 0xff));
                 }
                 if remote_tun_addr.is_none() {
                     remote_tun_addr = Some(format!("169.254.{}.{}", (id + 1) >> 8, (id + 1) & 0xff));
+                }
+                if local_tun_addr6.is_none() || remote_tun_addr6.is_none() {
+                    let (auto_local_ip6, auto_remote_ip6) = derive_auto_tun_ipv6(id);
+                    if local_tun_addr6.is_none() {
+                        local_tun_addr6 = Some(auto_local_ip6);
+                    }
+                    if remote_tun_addr6.is_none() {
+                        remote_tun_addr6 = Some(auto_remote_ip6);
+                    }
                 }
             }
         }
@@ -808,6 +857,8 @@ impl ResolvedConfig {
             tun_forward,
             local_tun_addr,
             remote_tun_addr,
+            local_tun_addr6,
+            remote_tun_addr6,
             local_post_up: args.local_post_up,
             remote_post_up: args.remote_post_up,
             reconnect_interval: args.reconnect_interval,
@@ -1005,6 +1056,22 @@ mod tests {
             | remote_ip1.split('.').nth(3).unwrap().parse::<u16>().unwrap();
         assert_eq!(local_lower, id1);
         assert_eq!(remote_lower, id1 + 1);
+
+        // Check IPv6 derivation
+        let (loc_v6, rem_v6) = derive_auto_tun_ipv6(id1);
+        let loc_addr: std::net::Ipv6Addr = loc_v6.parse().unwrap();
+        let rem_addr: std::net::Ipv6Addr = rem_v6.parse().unwrap();
+        let loc_oct = loc_addr.octets();
+        let rem_oct = rem_addr.octets();
+        assert_eq!(loc_oct[0], 0xfd);
+        assert_eq!(rem_oct[0], 0xfd);
+        // Same /127 subnet: first 15 bytes match
+        assert_eq!(loc_oct[0..15], rem_oct[0..15]);
+        // Top 7 bits of byte 15 match (total 119 subnet bits derived from id)
+        assert_eq!(loc_oct[15] & 0xfe, rem_oct[15] & 0xfe);
+        // Last bit: 0 for local, 1 for remote
+        assert_eq!(loc_oct[15] & 1, 0);
+        assert_eq!(rem_oct[15] & 1, 1);
     }
 
     #[test]
@@ -1066,6 +1133,11 @@ Host myserver
         assert_eq!(tun.remote_tun, format!("tun2222{}", id));
         assert!(resolved.local_tun_addr.is_some());
         assert!(resolved.remote_tun_addr.is_some());
+        assert!(resolved.local_tun_addr6.is_some());
+        assert!(resolved.remote_tun_addr6.is_some());
+        let (resolved_loc_v6, resolved_rem_v6) = derive_auto_tun_ipv6(id);
+        assert_eq!(resolved.local_tun_addr6, Some(resolved_loc_v6));
+        assert_eq!(resolved.remote_tun_addr6, Some(resolved_rem_v6));
 
         // -w with explicit auto:1024
         let args_auto_id = CliArgs::try_parse_from(["sshtun", "myserver", "-w", "auto:1024"]).unwrap();
@@ -1077,6 +1149,58 @@ Host myserver
         assert_eq!(tun_auto_id.remote_tun, "tun22221024");
         assert_eq!(resolved_auto_id.local_tun_addr, Some("169.254.4.0".to_string()));
         assert_eq!(resolved_auto_id.remote_tun_addr, Some("169.254.4.1".to_string()));
+        let (id1024_loc_v6, id1024_rem_v6) = derive_auto_tun_ipv6(1024);
+        assert_eq!(resolved_auto_id.local_tun_addr6, Some(id1024_loc_v6));
+        assert_eq!(resolved_auto_id.remote_tun_addr6, Some(id1024_rem_v6));
+    }
+
+    #[test]
+    fn test_derive_auto_tun_ipv6_properties() {
+        for test_id in [0, 1, 42, 1024, 65535] {
+            let (loc_s, rem_s) = derive_auto_tun_ipv6(test_id);
+            let loc: std::net::Ipv6Addr = loc_s.parse().unwrap();
+            let rem: std::net::Ipv6Addr = rem_s.parse().unwrap();
+
+            let loc_oct = loc.octets();
+            let rem_oct = rem.octets();
+
+            // Range: fd00::/8
+            assert_eq!(loc_oct[0], 0xfd);
+            assert_eq!(rem_oct[0], 0xfd);
+
+            // Subnet: /127
+            // First 14 bytes (112 bits) of subnet derived from id hash match
+            assert_eq!(loc_oct[0..15], rem_oct[0..15]);
+            // Byte 15 top 7 bits match (112 + 7 = 119 bits derived from id hash)
+            assert_eq!(loc_oct[15] & 0xfe, rem_oct[15] & 0xfe);
+
+            // Last bit: 0 for local, 1 for remote
+            assert_eq!(loc_oct[15] & 1, 0);
+            assert_eq!(rem_oct[15] & 1, 1);
+        }
+
+        // Distinct IDs produce distinct subnets
+        let (loc1, _) = derive_auto_tun_ipv6(1);
+        let (loc2, _) = derive_auto_tun_ipv6(2);
+        assert_ne!(loc1, loc2);
+    }
+
+    #[test]
+    fn test_cli_args_tun_custom_ipv6() {
+        let args = CliArgs::try_parse_from([
+            "sshtun",
+            "myserver",
+            "-w",
+            "0:0",
+            "--local-tun-addr6",
+            "fd00:1234::1",
+            "--remote-tun-addr6",
+            "fd00:1234::2",
+        ])
+        .unwrap();
+        let resolved = ResolvedConfig::from_args(args).unwrap();
+        assert_eq!(resolved.local_tun_addr6, Some("fd00:1234::1".to_string()));
+        assert_eq!(resolved.remote_tun_addr6, Some("fd00:1234::2".to_string()));
     }
 }
 
