@@ -2,18 +2,23 @@ use crate::config::TunForwardSpec;
 use crate::ssh::ClientHandler;
 use russh::client::Handle;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio_tun::TunBuilder;
 use tracing::{error, info, warn};
 
+pub struct TunSession {
+    pub tun: tokio_tun::Tun,
+    pub channel: russh::Channel<russh::client::Msg>,
+}
 
-pub async fn run_tun_forward(
+pub async fn setup_tun_forward(
     handle: Arc<Handle<ClientHandler>>,
-    spec: TunForwardSpec,
-    local_tun_addr: Option<String>,
-    remote_tun_addr: Option<String>,
-) -> anyhow::Result<()> {
+    spec: &TunForwardSpec,
+    local_tun_addr: Option<&str>,
+    remote_tun_addr: Option<&str>,
+) -> anyhow::Result<(TunSession, String)> {
     let dev_name = if spec.local_tun == "any" {
         "tun0".to_string()
     } else if spec.local_tun.starts_with("tun") {
@@ -24,20 +29,35 @@ pub async fn run_tun_forward(
 
     info!("Creating local TUN device '{}'...", dev_name);
 
-    let tun = TunBuilder::new()
+    let tun = match TunBuilder::new()
         .name(&dev_name)
         .tap(false)
         .packet_info(false)
         .up()
         .try_build()
-        .map_err(|e| anyhow::anyhow!("Failed to create local TUN device '{}': {}", dev_name, e))?;
-
+    {
+        Ok(t) => t,
+        Err(orig_err) => {
+            warn!(
+                "Failed to create local TUN device '{}': {}. Attempting cleanup and retry...",
+                dev_name, orig_err
+            );
+            let _ = Command::new("ip").args(&["link", "delete", &dev_name]).status().await;
+            TunBuilder::new()
+                .name(&dev_name)
+                .tap(false)
+                .packet_info(false)
+                .up()
+                .try_build()
+                .map_err(|e| anyhow::anyhow!("Failed to create local TUN device '{}': {}", dev_name, e))?
+        }
+    };
 
     let actual_dev_name = tun.name().to_string();
     info!("Local TUN device '{}' created successfully", actual_dev_name);
 
     // Configure local TUN IP address if provided
-    if let (Some(local_ip), Some(remote_ip)) = (local_tun_addr.as_ref(), remote_tun_addr.as_ref()) {
+    if let (Some(local_ip), Some(remote_ip)) = (local_tun_addr, remote_tun_addr) {
         info!(
             "Configuring local TUN device {} with address {} peer {}",
             actual_dev_name, local_ip, remote_ip
@@ -45,7 +65,7 @@ pub async fn run_tun_forward(
         let status = Command::new("ip")
             .args(&[
                 "addr",
-                "add",
+                "replace",
                 &format!("{}/32", local_ip.trim_end_matches("/32")),
                 "peer",
                 remote_ip.trim_end_matches("/32"),
@@ -54,6 +74,24 @@ pub async fn run_tun_forward(
             ])
             .status()
             .await;
+
+        let status = match status {
+            Ok(s) if s.success() => Ok(s),
+            _ => {
+                Command::new("ip")
+                    .args(&[
+                        "addr",
+                        "add",
+                        &format!("{}/32", local_ip.trim_end_matches("/32")),
+                        "peer",
+                        remote_ip.trim_end_matches("/32"),
+                        "dev",
+                        &actual_dev_name,
+                    ])
+                    .status()
+                    .await
+            }
+        };
 
         match status {
             Ok(s) if s.success() => {
@@ -84,20 +122,44 @@ pub async fn run_tun_forward(
     };
 
     info!("Opening SSH TUN channel (tun@openssh.com) for remote tun {}...", spec.remote_tun);
-    let channel = handle
-        .channel_open_tun(1, remote_tun_num)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to open tun@openssh.com SSH channel: {}", e))?;
+    let mut channel = None;
+    let mut last_err = None;
+    for attempt in 1..=5 {
+        match handle.channel_open_tun(1, remote_tun_num).await {
+            Ok(ch) => {
+                info!("SSH TUN channel established successfully (remote tun {})", spec.remote_tun);
+                channel = Some(ch);
+                break;
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to open SSH TUN channel on attempt {}/5 (remote tun {}): {}. Retrying in 1s...",
+                    attempt, spec.remote_tun, e
+                );
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+            }
+        }
+    }
 
-    info!("SSH TUN channel established successfully");
+    let channel = channel.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Failed to open tun@openssh.com SSH channel after 5 attempts: {:?}",
+            last_err
+        )
+    })?;
 
-    let stream = channel.into_stream();
+    Ok((TunSession { tun, channel }, actual_dev_name))
+}
+
+pub async fn run_tun_forward_loop(session: TunSession) -> anyhow::Result<()> {
+    let stream = session.channel.into_stream();
     let (mut channel_read, mut channel_write) = tokio::io::split(stream);
-    let (mut tun_read, mut tun_write) = tokio::io::split(tun);
+    let (mut tun_read, mut tun_write) = tokio::io::split(session.tun);
 
     // Task 1: Local TUN -> SSH Channel
-    let tun_to_ssh = tokio::spawn(async move {
-        let mut packet_buf = vec![0u8; 4096];
+    let mut tun_to_ssh = tokio::spawn(async move {
+        let mut packet_buf = vec![0u8; 65536];
         loop {
             // Leave space for 4-byte OpenSSH family header at index 0..4
             let n = match tun_read.read(&mut packet_buf[4..]).await {
@@ -126,11 +188,14 @@ pub async fn run_tun_forward(
     });
 
     // Task 2: SSH Channel -> Local TUN
-    let ssh_to_tun = tokio::spawn(async move {
-        let mut frame_buf = vec![0u8; 4096];
+    let mut ssh_to_tun = tokio::spawn(async move {
+        let mut frame_buf = vec![0u8; 65536];
         loop {
             let n = match channel_read.read(&mut frame_buf).await {
-                Ok(0) => break,
+                Ok(0) => {
+                    warn!("SSH TUN channel closed by remote (EOF)");
+                    break;
+                }
                 Ok(n) => n,
                 Err(e) => {
                     error!("Error reading from SSH TUN channel: {}", e);
@@ -151,6 +216,22 @@ pub async fn run_tun_forward(
         }
     });
 
-    let _ = tokio::join!(tun_to_ssh, ssh_to_tun);
-    Ok(())
+    tokio::select! {
+        res = &mut tun_to_ssh => {
+            ssh_to_tun.abort();
+            match res {
+                Ok(_) => warn!("TUN to SSH forwarding task completed"),
+                Err(e) => error!("TUN to SSH forwarding task panicked: {}", e),
+            }
+        }
+        res = &mut ssh_to_tun => {
+            tun_to_ssh.abort();
+            match res {
+                Ok(_) => warn!("SSH to TUN forwarding task completed"),
+                Err(e) => error!("SSH to TUN forwarding task panicked: {}", e),
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!("TUN forwarding session terminated"))
 }

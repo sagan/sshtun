@@ -54,9 +54,9 @@ pub async fn run_post_up_hooks(
                 let local_ip_clean = local_ip.trim_end_matches("/32");
 
                 let auto_setup_cmd = format!(
-                    "for i in $(seq 1 30); do if ip link show dev {tun_dev} >/dev/null 2>&1; then break; fi; sleep 0.1; done; \
+                    "for i in $(seq 1 50); do if ip link show dev {tun_dev} >/dev/null 2>&1; then break; fi; sleep 0.1; done; \
                      sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true; \
-                     ip addr add {remote_ip}/32 peer {local_ip} dev {tun_dev} 2>/dev/null || true; \
+                     ip addr replace {remote_ip}/32 peer {local_ip} dev {tun_dev} 2>/dev/null || ip addr add {remote_ip}/32 peer {local_ip} dev {tun_dev} 2>/dev/null || true; \
                      ip link set dev {tun_dev} up 2>/dev/null || true; \
                      nft 'add table inet sshtun{id}; delete table inet sshtun{id}; table inet sshtun{id} {{ chain prerouting {{ type filter hook prerouting priority mangle; policy accept; iifname \"{tun_dev}\" ct state new ct mark set {fwmark}; iifname != \"{tun_dev}\" ct mark {fwmark} meta mark set ct mark; }}; chain output {{ type route hook output priority mangle; policy accept; ct mark {fwmark} meta mark set ct mark; }}; chain postrouting {{ type nat hook postrouting priority srcnat; policy accept; oifname != \"{tun_dev}\" ip saddr {local_ip} masquerade; }}; }}'; \
                      ip rule del fwmark {fwmark}/0xffff0000 lookup 2222{id} 2>/dev/null || true; \
@@ -98,7 +98,10 @@ pub async fn run_post_up_hooks(
             };
 
             let auto_remote_cmd = format!(
-                "ip addr add {}/32 peer {} dev {} 2>/dev/null || true; ip link set {} up",
+                "ip addr replace {}/32 peer {} dev {} 2>/dev/null || ip addr add {}/32 peer {} dev {} 2>/dev/null || true; ip link set {} up",
+                remote_ip.trim_end_matches("/32"),
+                local_ip.trim_end_matches("/32"),
+                remote_tun_name,
                 remote_ip.trim_end_matches("/32"),
                 local_ip.trim_end_matches("/32"),
                 remote_tun_name,
@@ -183,9 +186,12 @@ pub async fn run_cleanup_hooks(
             let tun_dev = format!("tun2222{}", id);
             let cleanup_cmd = format!(
                 "nft 'add table inet sshtun{id}; delete table inet sshtun{id}' 2>/dev/null || true; \
+                 ip rule del fwmark {fwmark}/0xffff0000 lookup 2222{id} 2>/dev/null || true; \
                  ip rule del fwmark {fwmark}/0xffff0000 lookup {id} 2>/dev/null || true; \
+                 ip route del default dev {tun_dev} table 2222{id} 2>/dev/null || true; \
                  ip route del default dev {tun_dev} table {id} 2>/dev/null || true; \
-                 ip link set dev {tun_dev} down 2>/dev/null || true",
+                 ip link set dev {tun_dev} down 2>/dev/null || true; \
+                 ip link delete dev {tun_dev} 2>/dev/null || true",
                 id = id,
                 fwmark = fwmark,
                 tun_dev = tun_dev,

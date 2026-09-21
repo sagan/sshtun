@@ -86,6 +86,9 @@ async fn main() -> anyhow::Result<()> {
                             Err(e) => error!("Monitor task panicked: {}", e),
                         }
                     }
+                    Some(reason) = tunnel_mgr.exit_rx.recv() => {
+                        error!("Tunnel worker terminated: {}. Triggering reconnection...", reason);
+                    }
                     _ = signal::ctrl_c() => {
                         info!("Received Ctrl+C / SIGINT signal. Terminating sshtun...");
                         monitor_handle.abort();
@@ -110,6 +113,11 @@ async fn main() -> anyhow::Result<()> {
                                         std::process::exit(130);
                                     }
                                 }
+
+                                let _ = tokio::process::Command::new("ip")
+                                    .args(&["link", "delete", &tun.local_tun])
+                                    .status()
+                                    .await;
                             }
                         }
                         return Ok(());
@@ -117,6 +125,7 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 info!("Connection lost. Cleaning up active tunnels...");
+                monitor_handle.abort();
                 tunnel_mgr.abort_all();
 
                 if let Some(ref tun) = config.tun_forward {
@@ -127,6 +136,11 @@ async fn main() -> anyhow::Result<()> {
                             Duration::from_secs(2),
                             hooks::run_cleanup_hooks(&cleanup_handle, &cleanup_config)
                         ).await;
+
+                        let _ = tokio::process::Command::new("ip")
+                            .args(&["link", "delete", &tun.local_tun])
+                            .status()
+                            .await;
                     }
                 }
             }
