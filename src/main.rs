@@ -46,6 +46,9 @@ async fn main() -> anyhow::Result<()> {
     info!("Local forwards: {}", config.local_forwards.len());
     info!("Remote forwards: {}", config.remote_forwards.len());
     info!("Dynamic forwards: {}", config.dynamic_forwards.len());
+    if let Some(mark) = config.fwmark {
+        info!("SSH socket fwmark configured: {:#x} ({})", mark, mark);
+    }
 
     loop {
         info!("Attempting SSH connection to {}:{}...", config.hostname, config.port);

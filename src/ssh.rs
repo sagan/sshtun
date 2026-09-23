@@ -7,6 +7,7 @@ use tracing::{error, info, warn};
 
 pub struct IncomingForwardedTcp {
     pub channel: Channel<client::Msg>,
+    #[allow(dead_code)]
     pub connected_address: String,
     pub connected_port: u32,
     pub originator_address: String,
@@ -129,6 +130,51 @@ pub struct SshConnection {
     pub _jump_handles: Vec<Box<dyn std::any::Any + Send + Sync>>,
 }
 
+pub async fn connect_tcp(
+    host: &str,
+    port: u16,
+    fwmark: Option<u32>,
+) -> anyhow::Result<tokio::net::TcpStream> {
+    use tokio::net::lookup_host;
+    use tokio::net::TcpSocket;
+
+    let addrs = lookup_host((host, port))
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to resolve {}:{}: {}", host, port, e))?;
+
+    let mut last_err = None;
+
+    for addr in addrs {
+        let socket = match addr {
+            std::net::SocketAddr::V4(_) => TcpSocket::new_v4(),
+            std::net::SocketAddr::V6(_) => TcpSocket::new_v6(),
+        }
+        .map_err(|e| anyhow::anyhow!("Failed to create TCP socket for {}: {}", addr, e))?;
+
+        if let Some(mark) = fwmark {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            {
+                nix::sys::socket::setsockopt(&socket, nix::sys::socket::sockopt::Mark, &mark)
+                    .map_err(|e| anyhow::anyhow!("Failed to set SO_MARK ({:#x}) on SSH socket: {}", mark, e))?;
+                tracing::debug!("Set SO_MARK {:#x} on SSH socket for {}", mark, addr);
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            {
+                return Err(anyhow::anyhow!("Setting fwmark is only supported on Linux"));
+            }
+        }
+
+        match socket.connect(addr).await {
+            Ok(stream) => return Ok(stream),
+            Err(e) => {
+                last_err = Some(anyhow::anyhow!("Failed to connect to {}: {}", addr, e));
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Could not resolve or connect to {}:{}", host, port)))
+}
+
 impl SshConnection {
     pub async fn connect(config: &crate::config::ResolvedConfig) -> anyhow::Result<Self> {
         let ssh_client_config = Arc::new(client::Config {
@@ -140,11 +186,15 @@ impl SshConnection {
 
         if config.jump_hosts.is_empty() {
             info!("Connecting to {}:{} as user '{}'...", config.hostname, config.port, config.user);
+            if let Some(mark) = config.fwmark {
+                info!("Setting netfilter fwmark {:#x} on SSH socket", mark);
+            }
 
             let (forwarded_tcp_tx, forwarded_tcp_rx) = mpsc::channel(100);
             let handler = ClientHandler { forwarded_tcp_tx };
 
-            let mut handle = client::connect(ssh_client_config, (config.hostname.as_str(), config.port), handler)
+            let socket = connect_tcp(&config.hostname, config.port, config.fwmark).await?;
+            let mut handle = client::connect_stream(ssh_client_config, socket, handler)
                 .await
                 .map_err(|e| anyhow::anyhow!("SSH connect failed to {}:{}: {}", config.hostname, config.port, e))?;
 
@@ -157,12 +207,16 @@ impl SshConnection {
             })
         } else {
             info!("Connecting through {} jump server(s)...", config.jump_hosts.len());
+            if let Some(mark) = config.fwmark {
+                info!("Setting netfilter fwmark {:#x} on SSH socket", mark);
+            }
 
             // 1. Connect to the first jump host directly via TCP
             let j1 = &config.jump_hosts[0];
             info!("Connecting to jump server 1/{} ({}:{} as user '{}')...", config.jump_hosts.len(), j1.hostname, j1.port, j1.user);
 
-            let mut j1_handle = client::connect(ssh_client_config.clone(), (j1.hostname.as_str(), j1.port), DummyHandler)
+            let j1_socket = connect_tcp(&j1.hostname, j1.port, config.fwmark).await?;
+            let mut j1_handle = client::connect_stream(ssh_client_config.clone(), j1_socket, DummyHandler)
                 .await
                 .map_err(|e| anyhow::anyhow!("SSH connect failed to jump host {}:{}: {}", j1.hostname, j1.port, e))?;
 
@@ -218,6 +272,43 @@ impl SshConnection {
                 forwarded_tcp_rx,
                 _jump_handles,
             })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_connect_tcp_with_and_without_fwmark() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+
+        // Test connection without fwmark
+        let s1 = connect_tcp("127.0.0.1", port, None).await.unwrap();
+        drop(s1);
+
+        // Test connection with fwmark
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let mark = 0x5678;
+            let res = connect_tcp("127.0.0.1", port, Some(mark)).await;
+            match res {
+                Ok(stream) => {
+                    let retrieved = nix::sys::socket::getsockopt(&stream, nix::sys::socket::sockopt::Mark).unwrap();
+                    assert_eq!(retrieved, mark);
+                }
+                Err(e) => {
+                    assert!(e.to_string().contains("SO_MARK"));
+                }
+            }
         }
     }
 }

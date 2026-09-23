@@ -79,6 +79,10 @@ pub struct CliArgs {
     #[arg(long = "keepalive-max", default_value_t = 3)]
     pub keepalive_max: u32,
 
+    /// Netfilter fwmark for created SSH socket (e.g. 0x1000 or 4096)
+    #[arg(long = "fwmark", alias = "mark", value_parser = parse_fwmark)]
+    pub fwmark: Option<u32>,
+
     /// Verbose logging output
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
     pub verbose: u8,
@@ -143,6 +147,16 @@ pub struct ResolvedConfig {
     pub reconnect_interval: u64,
     pub keepalive_interval: u64,
     pub keepalive_max: u32,
+    pub fwmark: Option<u32>,
+}
+
+pub fn parse_fwmark(s: &str) -> std::result::Result<u32, String> {
+    let s = s.trim();
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u32::from_str_radix(hex, 16).map_err(|e| format!("Invalid hex fwmark '{}': {}", s, e))
+    } else {
+        s.parse::<u32>().map_err(|e| format!("Invalid fwmark '{}': {}", s, e))
+    }
 }
 
 fn parse_host_port_pair(s: &str, default_host: &str) -> Result<(String, u16)> {
@@ -864,6 +878,7 @@ impl ResolvedConfig {
             reconnect_interval: args.reconnect_interval,
             keepalive_interval: args.keepalive_interval,
             keepalive_max: args.keepalive_max,
+            fwmark: args.fwmark,
         })
     }
 }
@@ -873,6 +888,47 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_parse_fwmark() {
+        assert_eq!(parse_fwmark("0").unwrap(), 0);
+        assert_eq!(parse_fwmark("42").unwrap(), 42);
+        assert_eq!(parse_fwmark("4294967295").unwrap(), u32::MAX);
+        assert_eq!(parse_fwmark("0x0").unwrap(), 0);
+        assert_eq!(parse_fwmark("0x10").unwrap(), 16);
+        assert_eq!(parse_fwmark("0x1000").unwrap(), 4096);
+        assert_eq!(parse_fwmark("0Xabcd").unwrap(), 0xabcd);
+        assert_eq!(parse_fwmark("  0xffffffff  ").unwrap(), u32::MAX);
+
+        assert!(parse_fwmark("").is_err());
+        assert!(parse_fwmark("invalid").is_err());
+        assert!(parse_fwmark("0xG").is_err());
+        assert!(parse_fwmark("-1").is_err());
+        assert!(parse_fwmark("4294967296").is_err());
+    }
+
+    #[test]
+    fn test_cli_args_fwmark() {
+        // Without flag
+        let args = CliArgs::try_parse_from(["sshtun", "myserver"]).unwrap();
+        assert_eq!(args.fwmark, None);
+
+        // With decimal --fwmark
+        let args = CliArgs::try_parse_from(["sshtun", "myserver", "--fwmark", "100"]).unwrap();
+        assert_eq!(args.fwmark, Some(100));
+
+        // With hex --fwmark
+        let args = CliArgs::try_parse_from(["sshtun", "myserver", "--fwmark", "0x1000"]).unwrap();
+        assert_eq!(args.fwmark, Some(0x1000));
+
+        // With alias --mark
+        let args = CliArgs::try_parse_from(["sshtun", "myserver", "--mark", "0x20"]).unwrap();
+        assert_eq!(args.fwmark, Some(0x20));
+
+        // ResolvedConfig propagates fwmark
+        let resolved = ResolvedConfig::from_args(args).unwrap();
+        assert_eq!(resolved.fwmark, Some(0x20));
+    }
 
     #[test]
     fn test_parse_local_forward() {

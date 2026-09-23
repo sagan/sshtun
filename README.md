@@ -20,6 +20,8 @@
   - Automatically provisions TUN interfaces `tun2222<id>` with `-w auto` (or `-w auto:<id>`) with derived or assigned `<id>` and link-local IP addresses, configuring server nftables firewall and routing out of the box.
   - Configures point-to-point /32 IP address pairs on local TUN interfaces via `--local-tun-addr` and `--remote-tun-addr`.
   - Supports `--local-post-up <cmdline>` and `--remote-post-up <cmdline>` hook scripts with `%i` interface name placeholder (e.g. `ip route add ... dev %i`) for custom routing and firewall rules.
+- **Netfilter fwmark Support**:
+  - Assigns `SO_MARK` on created SSH TCP sockets with `--fwmark <mark>` (or `--mark <mark>`) to allow policy routing without routing loops.
 - **Link Supervision & Auto-Reconnect**:
   - Built-in keepalive ping health monitor (`keepalive@openssh.com`).
   - Automatically tears down stale tunnels and reconnects upon link failure.
@@ -87,6 +89,8 @@ Options:
           Seconds between link keepalive ping checks [default: 10]
       --keepalive-max <KEEPALIVE_MAX>
           Max failed keepalive pings before declaring link dead [default: 3]
+      --fwmark <FWMARK>
+          Netfilter fwmark for created SSH socket (e.g. 0x1000 or 4096)
   -v, --verbose...
           Verbose logging output
   -h, --help
@@ -137,6 +141,16 @@ sudo sshtun root@remote-server -w 0:0 \
   --remote-tun-addr 192.168.100.2 \
   --local-post-up "ip route add 10.0.0.0/24 dev %i via 192.168.100.2" \
   --remote-post-up "iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE"
+```
+
+### 4. Policy Routing with Netfilter fwmark
+
+Avoid routing loops when directing default traffic through the tunnel by assigning a netfilter fwmark (`SO_MARK`) to the SSH connection socket:
+
+```bash
+sudo sshtun root@remote-server -w auto \
+  --fwmark 0x1000 \
+  --local-post-up "ip rule add not fwmark 0x1000 table 5; ip route add default dev %i table 5"
 ```
 
 ---
