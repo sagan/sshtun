@@ -196,6 +196,23 @@ pub async fn setup_tun_forward(
                     attempt, spec.remote_tun, e
                 );
                 last_err = Some(e);
+
+                // If remote tun interface already exists or is stale on server, delete it before retrying
+                let remote_dev = if spec.remote_tun.starts_with("tun") {
+                    spec.remote_tun.clone()
+                } else if spec.remote_tun != "any" {
+                    format!("tun{}", spec.remote_tun)
+                } else {
+                    String::new()
+                };
+                if !remote_dev.is_empty() {
+                    let del_cmd = format!("ip link delete dev {} 2>/dev/null || true", remote_dev);
+                    let h = handle.clone();
+                    let _ = tokio::time::timeout(Duration::from_secs(2), async move {
+                        let _ = crate::hooks::run_remote_command(&h, &del_cmd).await;
+                    }).await;
+                }
+
                 tokio::time::sleep(Duration::from_millis(1000)).await;
             }
         }

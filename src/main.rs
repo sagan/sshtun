@@ -6,13 +6,69 @@ mod tunnels;
 
 use clap::Parser;
 use config::{CliArgs, ResolvedConfig};
-use ssh::SshConnection;
+use russh::client::Handle;
+use ssh::{ClientHandler, SshConnection};
 use std::time::Duration;
 use tokio::signal;
 use tokio::time::sleep;
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 use tunnels::TunnelManager;
+
+async fn wait_for_shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
+        tokio::select! {
+            _ = signal::ctrl_c() => "Ctrl+C / SIGINT",
+            _ = sigterm.recv() => "SIGTERM",
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = signal::ctrl_c().await;
+        "Ctrl+C / SIGINT"
+    }
+}
+
+async fn handle_termination(
+    handle: &Handle<ClientHandler>,
+    config: &ResolvedConfig,
+    monitor_handle: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+    tunnel_mgr: &mut TunnelManager,
+    signal_name: &str,
+) {
+    info!("Received {} signal. Terminating sshtun...", signal_name);
+    monitor_handle.abort();
+    tunnel_mgr.abort_all();
+
+    if let Some(ref tun) = config.tun_forward {
+        if tun.auto_id.is_some() {
+            info!("Cleaning up remote server rules... (Press Ctrl+C again to force exit)");
+            let cleanup_config = config.clone();
+            tokio::select! {
+                res = tokio::time::timeout(
+                    Duration::from_secs(4),
+                    hooks::run_cleanup_hooks(handle, &cleanup_config)
+                ) => {
+                    if res.is_err() {
+                        warn!("Remote cleanup timed out after 4 seconds.");
+                    }
+                }
+                _ = signal::ctrl_c() => {
+                    warn!("Second Ctrl+C received. Force exiting immediately.");
+                    std::process::exit(130);
+                }
+            }
+
+            let _ = tokio::process::Command::new("ip")
+                .args(&["link", "delete", &tun.local_tun])
+                .status()
+                .await;
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -57,6 +113,20 @@ async fn main() -> anyhow::Result<()> {
             Ok(mut ssh_conn) => {
                 info!("SSH connection established successfully to {}:{}", config.hostname, config.port);
 
+                // Run pre-tunnel cleanup on remote server for auto TUN if configured, to clear any
+                // stale interface or firewall/routing rules left from previous broken connections.
+                if let Some(ref tun) = config.tun_forward {
+                    if tun.auto_id.is_some() {
+                        let cleanup_handle = ssh_conn.handle.clone();
+                        let cleanup_config = config.clone();
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(4),
+                            hooks::run_cleanup_hooks(&cleanup_handle, &cleanup_config),
+                        )
+                        .await;
+                    }
+                }
+
                 // Start tunnels
                 let mut tunnel_mgr = match TunnelManager::start(&mut ssh_conn.handle, &config, ssh_conn.forwarded_tcp_rx).await {
                     Ok(mgr) => mgr,
@@ -92,37 +162,8 @@ async fn main() -> anyhow::Result<()> {
                     Some(reason) = tunnel_mgr.exit_rx.recv() => {
                         error!("Tunnel worker terminated: {}. Triggering reconnection...", reason);
                     }
-                    _ = signal::ctrl_c() => {
-                        info!("Received Ctrl+C / SIGINT signal. Terminating sshtun...");
-                        monitor_handle.abort();
-                        tunnel_mgr.abort_all();
-
-                        if let Some(ref tun) = config.tun_forward {
-                            if tun.auto_id.is_some() {
-                                info!("Cleaning up remote server rules... (Press Ctrl+C again to force exit)");
-                                let cleanup_handle = ssh_conn.handle.clone();
-                                let cleanup_config = config.clone();
-                                tokio::select! {
-                                    res = tokio::time::timeout(
-                                        Duration::from_secs(4),
-                                        hooks::run_cleanup_hooks(&cleanup_handle, &cleanup_config)
-                                    ) => {
-                                        if res.is_err() {
-                                            warn!("Remote cleanup timed out after 4 seconds.");
-                                        }
-                                    }
-                                    _ = signal::ctrl_c() => {
-                                        warn!("Second Ctrl+C received. Force exiting immediately.");
-                                        std::process::exit(130);
-                                    }
-                                }
-
-                                let _ = tokio::process::Command::new("ip")
-                                    .args(&["link", "delete", &tun.local_tun])
-                                    .status()
-                                    .await;
-                            }
-                        }
+                    sig_name = wait_for_shutdown_signal() => {
+                        handle_termination(&ssh_conn.handle, &config, &mut monitor_handle, &mut tunnel_mgr, sig_name).await;
                         return Ok(());
                     }
                 }
