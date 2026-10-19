@@ -829,6 +829,9 @@ impl Session {
                     Some(GlobalRequestResponse::Keepalive) => {
                         // ignore keepalives
                     }
+                    Some(GlobalRequestResponse::CheckAlive(reply)) => {
+                        let _ = reply.send(());
+                    }
                     Some(GlobalRequestResponse::TcpIpForward(return_channel)) => {
                         let result = if buf.len() == 1 {
                             // If a specific port was requested, the reply has no data
@@ -859,6 +862,9 @@ impl Session {
                 match self.open_global_requests.pop_front() {
                     Some(GlobalRequestResponse::Keepalive) => {
                         // ignore keepalives
+                    }
+                    Some(GlobalRequestResponse::CheckAlive(reply)) => {
+                        let _ = reply.send(());
                     }
                     Some(GlobalRequestResponse::TcpIpForward(return_channel)) => {
                         let _ = return_channel.send(None);

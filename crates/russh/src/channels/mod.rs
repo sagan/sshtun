@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -121,6 +122,7 @@ pub struct Channel<Send: From<(ChannelId, ChannelMsg)>> {
     pub(crate) receiver: UnboundedReceiver<ChannelMsg>,
     pub(crate) max_packet_size: u32,
     pub(crate) window_size: Arc<Mutex<u32>>,
+    pub(crate) closed: AtomicBool,
 }
 
 impl<T: From<(ChannelId, ChannelMsg)>> std::fmt::Debug for Channel<T> {
@@ -146,12 +148,30 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
                 receiver: rx,
                 max_packet_size,
                 window_size: window_size.clone(),
+                closed: AtomicBool::new(false),
             },
             ChannelRef {
                 sender: tx,
                 window_size,
             },
         )
+    }
+
+    pub(crate) fn new_open(
+        id: ChannelId,
+        sender: Sender<S>,
+        receiver: UnboundedReceiver<ChannelMsg>,
+        max_packet_size: u32,
+        window_size: Arc<Mutex<u32>>,
+    ) -> Self {
+        Self {
+            id,
+            sender,
+            receiver,
+            max_packet_size,
+            window_size,
+            closed: AtomicBool::new(false),
+        }
     }
 
     /// Returns the min between the maximum packet size and the
@@ -315,6 +335,7 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
 
     /// Request that the channel be closed.
     pub async fn close(&self) -> Result<(), Error> {
+        self.closed.store(true, Ordering::Relaxed);
         self.send_msg(ChannelMsg::Close).await
     }
 
@@ -373,5 +394,13 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
             self.max_packet_size,
             ext,
         )
+    }
+}
+
+impl<S: From<(ChannelId, ChannelMsg)>> Drop for Channel<S> {
+    fn drop(&mut self) {
+        if !self.closed.swap(true, Ordering::Relaxed) {
+            let _ = self.sender.try_send((self.id, ChannelMsg::Close).into());
+        }
     }
 }

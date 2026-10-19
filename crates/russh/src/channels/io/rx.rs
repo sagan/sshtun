@@ -20,7 +20,7 @@ where
 
 impl<'i, S> ChannelRx<'i, S>
 where
-    S: From<(ChannelId, ChannelMsg)>,
+    S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static,
 {
     pub fn new(channel: impl Into<ChannelAsMut<'i, S>>, ext: Option<u32>) -> Self {
         Self {
@@ -28,6 +28,10 @@ where
             buffer: None,
             ext,
         }
+    }
+
+    pub async fn close(&mut self) -> Result<(), crate::Error> {
+        self.channel.as_mut().close().await
     }
 }
 

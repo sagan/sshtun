@@ -58,6 +58,7 @@ pub async fn run_local_forward(
             let server_to_client = tokio::io::copy(&mut channel_read, &mut socket_write);
 
             let _ = tokio::join!(client_to_server, server_to_client);
+            let _ = stream.close().await;
         });
     }
 }

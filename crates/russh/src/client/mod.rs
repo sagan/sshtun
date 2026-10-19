@@ -174,6 +174,9 @@ pub enum Msg {
         description: String,
         language_tag: String,
     },
+    CheckAlive {
+        reply: oneshot::Sender<()>,
+    },
     Channel(ChannelId, ChannelMsg),
 }
 
@@ -436,13 +439,13 @@ impl<H: Handler> Handle<H> {
                 }) => {
                     *window_size_ref.lock().await = window_size;
 
-                    return Ok(Channel {
+                    return Ok(Channel::new_open(
                         id,
-                        sender: self.sender.clone(),
+                        self.sender.clone(),
                         receiver,
                         max_packet_size,
-                        window_size: window_size_ref,
-                    });
+                        window_size_ref,
+                    ));
                 }
                 Some(ChannelMsg::OpenFailure(reason)) => {
                     return Err(crate::Error::ChannelOpenFailure(reason));
@@ -625,6 +628,20 @@ impl<H: Handler> Handle<H> {
         }
     }
 
+    /// Sends a keepalive global request and awaits response
+    pub async fn check_alive(&self) -> Result<(), crate::Error> {
+        let (reply_send, reply_recv) = oneshot::channel();
+        self.sender
+            .send(Msg::CheckAlive { reply: reply_send })
+            .await
+            .map_err(|_| crate::Error::SendError)?;
+
+        match reply_recv.await {
+            Ok(()) => Ok(()),
+            Err(_) => Err(crate::Error::Disconnect),
+        }
+    }
+
     /// Sends a disconnect message.
     pub async fn disconnect(
         &self,
@@ -714,7 +731,7 @@ where
     // Reading SSH id and allocating a session if correct.
     let mut stream = SshRead::new(stream);
     let sshid = stream.read_ssh_id().await?;
-    let (handle_sender, session_receiver) = channel(10);
+    let (handle_sender, session_receiver) = channel(1024);
     let (session_sender, handle_receiver) = unbounded_channel();
     if config.maximum_packet_size > 65535 {
         error!(
@@ -780,7 +797,7 @@ impl Session {
         receiver: Receiver<Msg>,
         sender: UnboundedSender<Reply>,
     ) -> Self {
-        let (inbound_channel_sender, inbound_channel_receiver) = channel(10);
+        let (inbound_channel_sender, inbound_channel_receiver) = channel(1024);
         Self {
             common,
             receiver,
@@ -1093,6 +1110,7 @@ impl Session {
                 description,
                 language_tag,
             } => self.disconnect(reason, &description, &language_tag),
+            Msg::CheckAlive { reply } => self.send_check_alive(reply),
             Msg::Channel(id, ChannelMsg::Data { data }) => self.data(id, data),
             Msg::Channel(id, ChannelMsg::Eof) => {
                 self.eof(id);

@@ -35,6 +35,7 @@ pub async fn run_remote_command(
     let mut stream = channel.into_stream();
     let mut output = String::new();
     let _ = stream.read_to_string(&mut output).await;
+    let _ = stream.close().await;
 
     Ok(output)
 }

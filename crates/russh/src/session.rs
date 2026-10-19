@@ -622,6 +622,8 @@ pub(crate) struct NewKeys {
 pub(crate) enum GlobalRequestResponse {
     /// request was for Keepalive, ignore result
     Keepalive,
+    /// request was for CheckAlive/Ping, reply when server responds
+    CheckAlive(oneshot::Sender<()>),
     /// request was for TcpIpForward, sends Some(port) for success or None for failure
     TcpIpForward(oneshot::Sender<Option<u32>>),
     /// request was for CancelTcpIpForward, sends true for success or false for failure

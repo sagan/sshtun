@@ -27,15 +27,14 @@ pub async fn run_link_monitor(
         debug!("Sending SSH keepalive ping...");
         let ping_res = tokio::time::timeout(
             Duration::from_secs(5),
-            handle.channel_open_session(),
+            handle.check_alive(),
         )
         .await;
 
         match ping_res {
-            Ok(Ok(channel)) => {
+            Ok(Ok(())) => {
                 debug!("Keepalive ping succeeded");
                 failures = 0;
-                let _ = channel.close().await;
             }
             Ok(Err(e)) => {
                 failures += 1;

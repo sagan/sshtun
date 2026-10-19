@@ -18,10 +18,14 @@ where
 
 impl<S> ChannelStream<S>
 where
-    S: From<(ChannelId, ChannelMsg)>,
+    S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static,
 {
     pub(super) fn new(tx: ChannelTx<S>, rx: ChannelRx<'static, S>) -> Self {
         Self { tx, rx }
+    }
+
+    pub async fn close(&mut self) -> Result<(), crate::Error> {
+        self.rx.close().await
     }
 }
 

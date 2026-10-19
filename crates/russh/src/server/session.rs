@@ -310,13 +310,13 @@ impl Handle {
                 }) => {
                     *window_size_ref.lock().await = window_size;
 
-                    return Ok(Channel {
+                    return Ok(Channel::new_open(
                         id,
-                        sender: self.sender.clone(),
+                        self.sender.clone(),
                         receiver,
                         max_packet_size,
-                        window_size: window_size_ref,
-                    });
+                        window_size_ref,
+                    ));
                 }
                 Some(ChannelMsg::OpenFailure(reason)) => {
                     return Err(Error::ChannelOpenFailure(reason))
