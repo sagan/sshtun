@@ -23,6 +23,10 @@
   - Supports `--local-post-up <cmdline>` and `--remote-post-up <cmdline>` hook scripts with `%i` interface name placeholder (e.g. `ip route add ... dev %i`) for custom routing and firewall rules.
 - **Netfilter fwmark Support**:
   - Assigns `SO_MARK` on created SSH TCP sockets with `--fwmark <mark>` (or `--mark <mark>`) to allow policy routing without routing loops.
+- **Multi-Connection Management (`--config <file>`)**:
+  - Run multiple independent SSH connections concurrently in a single instance with zero process overhead.
+  - Simple plain text configuration format where each line contains standard `sshtun` command-line flags.
+  - Independent reconnection supervision and graceful, parallel termination.
 - **Link Supervision & Auto-Reconnect**:
   - Built-in keepalive ping health monitor (`keepalive@openssh.com`).
   - Automatically tears down stale tunnels and reconnects upon link failure.
@@ -52,12 +56,14 @@ The binary will be available at `./target/release/sshtun`.
 ```text
 Pure Rust SSH tunnel manager with TUN support and auto-reconnect
 
-Usage: sshtun [OPTIONS] <DESTINATION>
+Usage: sshtun [OPTIONS] [DESTINATION]
 
 Arguments:
-  <DESTINATION>  Remote host or SSH alias, optionally with user/port: [user@]host[:port]
+  [DESTINATION]  Remote host or SSH alias, optionally with user/port: [user@]host[:port]
 
 Options:
+  -c, --config <CONFIG>
+          Path to a config file containing SSH connection parameter lines
   -p, --port <PORT>
           SSH server port override
   -i, --identity <IDENTITY>
@@ -190,6 +196,29 @@ sshtun internal-target -J bastion -L 8080:127.0.0.1:80
 # Supports chained multi-hop jump proxies:
 sshtun internal-target -J jump1,jump2:2222
 ```
+
+### 6. Multi-Connection Plain Text Configuration File
+
+Start multiple concurrent SSH connections in a single `sshtun` process:
+
+Create a plain text configuration file (e.g. `tunnels.conf`):
+
+```text
+# Example sshtun configuration file
+# Each line represents an independent SSH connection using standard sshtun flags.
+# Comments (#) and blank lines are ignored.
+
+-N --fwmark 0x100 -R 8500:10.3.5.24:8500 -w auto:10 10.3.1.31
+-N --fwmark 0x100 -w auto:101 -p 222 --remote-post-up "ip route add 0.0.0.0/1 dev %i; ip route add 128.0.0.0/1 dev %i" 172.24.3.19
+```
+
+Run with `--config` (or `-c`):
+
+```bash
+sshtun --config tunnels.conf
+```
+
+`sshtun` validates all configuration lines and flags at startup before initiating any connections. Each connection runs concurrently as an independent Tokio task with its own auto-reconnect supervisor, health monitoring, and isolated error handling. When terminating via Ctrl+C / SIGTERM, all connections clean up remote firewall and routing rules in parallel.
 
 ---
 

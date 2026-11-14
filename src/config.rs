@@ -8,8 +8,13 @@ use sha2::{Digest, Sha256};
 #[derive(Parser, Debug, Clone)]
 #[command(name = "sshtun", author, version, about = "Pure Rust SSH tunnel manager with TUN support and auto-reconnect")]
 pub struct CliArgs {
+    /// Path to a config file containing SSH connection parameter lines
+    #[arg(short = 'c', long = "config", conflicts_with = "destination")]
+    pub config: Option<PathBuf>,
+
     /// Remote host or SSH alias, optionally with user/port: [user@]host[:port]
-    pub destination: String,
+    #[arg(required_unless_present = "config")]
+    pub destination: Option<String>,
 
     /// SSH server port override
     #[arg(short = 'p', long = "port")]
@@ -852,8 +857,13 @@ impl ResolvedConfig {
     }
 
     pub fn from_args_with_config_path(args: CliArgs, config_path: Option<&std::path::Path>) -> Result<Self> {
+        let dest = args
+            .destination
+            .as_deref()
+            .ok_or_else(|| anyhow!("Destination host is required"))?;
+
         let (target_config, extracted) = resolve_host_config_full(
-            &args.destination,
+            dest,
             args.port,
             &args.identity,
             config_path,
@@ -989,6 +999,148 @@ impl ResolvedConfig {
             use_iptables: args.use_iptables,
         })
     }
+
+    pub fn from_config_file(path: &std::path::Path) -> Result<Vec<Self>> {
+        Self::from_config_file_with_ssh_config(path, None)
+    }
+
+    pub fn from_config_file_with_ssh_config(
+        path: &std::path::Path,
+        ssh_config_path: Option<&std::path::Path>,
+    ) -> Result<Vec<Self>> {
+        parse_config_file_with_ssh_config(path, ssh_config_path)
+    }
+}
+
+#[allow(dead_code)]
+pub fn parse_config_file(path: &std::path::Path) -> Result<Vec<ResolvedConfig>> {
+    parse_config_file_with_ssh_config(path, None)
+}
+
+pub fn parse_config_file_with_ssh_config(
+    path: &std::path::Path,
+    ssh_config_path: Option<&std::path::Path>,
+) -> Result<Vec<ResolvedConfig>> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| anyhow!("Failed to read config file '{}': {}", path.display(), e))?;
+    parse_config_str(&content, &path.display().to_string(), ssh_config_path)
+}
+
+pub fn parse_config_str(
+    content: &str,
+    source_name: &str,
+    ssh_config_path: Option<&std::path::Path>,
+) -> Result<Vec<ResolvedConfig>> {
+    let mut configs = Vec::new();
+
+    for (line_idx, raw_line) in content.lines().enumerate() {
+        let line_no = line_idx + 1;
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        let words = shlex::split(trimmed).ok_or_else(|| {
+            anyhow!(
+                "{}:{}: syntax error: unmatched quote or invalid escape in line: {}",
+                source_name,
+                line_no,
+                trimmed
+            )
+        })?;
+
+        if words.is_empty() {
+            continue;
+        }
+
+        let mut argv = vec!["sshtun".to_string()];
+        argv.extend(words);
+
+        let line_args = CliArgs::try_parse_from(&argv).map_err(|e| {
+            anyhow!(
+                "{}:{}: failed to parse arguments: {}",
+                source_name,
+                line_no,
+                e
+            )
+        })?;
+
+        if line_args.config.is_some() {
+            return Err(anyhow!(
+                "{}:{}: nested --config is not allowed",
+                source_name,
+                line_no
+            ));
+        }
+
+        if line_args.destination.is_none() {
+            return Err(anyhow!(
+                "{}:{}: missing destination host",
+                source_name,
+                line_no
+            ));
+        }
+
+        let resolved = ResolvedConfig::from_args_with_config_path(line_args, ssh_config_path)
+            .map_err(|e| {
+                anyhow!(
+                    "{}:{}: invalid configuration: {}",
+                    source_name,
+                    line_no,
+                    e
+                )
+            })?;
+
+        configs.push(resolved);
+    }
+
+    if configs.is_empty() {
+        return Err(anyhow!(
+            "{}: no valid SSH connection configurations found",
+            source_name
+        ));
+    }
+
+    // Verify no conflicting local TUN interface names across connections
+    let mut seen_tuns = std::collections::HashSet::new();
+    for cfg in &configs {
+        if let Some(ref tun) = cfg.tun_forward {
+            if !seen_tuns.insert(&tun.local_tun) {
+                return Err(anyhow!(
+                    "{}: conflicting local TUN interface '{}' specified in multiple connections",
+                    source_name,
+                    tun.local_tun
+                ));
+            }
+        }
+    }
+
+    // Verify no conflicting local forward listen ports across connections
+    let mut seen_binds = std::collections::HashSet::new();
+    for cfg in &configs {
+        for lf in &cfg.local_forwards {
+            let key = format!("{}:{}", lf.bind_addr, lf.bind_port);
+            if !seen_binds.insert(key.clone()) {
+                return Err(anyhow!(
+                    "{}: conflicting local forward bind '{}' specified in multiple connections",
+                    source_name,
+                    key
+                ));
+            }
+        }
+        for df in &cfg.dynamic_forwards {
+            let key = format!("{}:{}", df.bind_addr, df.bind_port);
+            if !seen_binds.insert(key.clone()) {
+                return Err(anyhow!(
+                    "{}: conflicting dynamic SOCKS5 forward bind '{}' specified in multiple connections",
+                    source_name,
+                    key
+                ));
+            }
+        }
+    }
+
+    Ok(configs)
 }
 
 #[cfg(test)]
@@ -1619,6 +1771,139 @@ Host target-with-jump
         assert!(args_iptables.use_iptables);
         let resolved_iptables = ResolvedConfig::from_args(args_iptables).unwrap();
         assert!(resolved_iptables.use_iptables);
+    }
+
+    #[test]
+    fn test_cli_args_config_flag() {
+        // -c / --config without destination is valid
+        let args_short = CliArgs::try_parse_from(["sshtun", "-c", "/etc/sshtun.conf"]).unwrap();
+        assert_eq!(args_short.config, Some(PathBuf::from("/etc/sshtun.conf")));
+        assert!(args_short.destination.is_none());
+
+        let args_long = CliArgs::try_parse_from(["sshtun", "--config", "/etc/sshtun.conf"]).unwrap();
+        assert_eq!(args_long.config, Some(PathBuf::from("/etc/sshtun.conf")));
+        assert!(args_long.destination.is_none());
+
+        // Normal destination without --config
+        let args_dest = CliArgs::try_parse_from(["sshtun", "myserver"]).unwrap();
+        assert!(args_dest.config.is_none());
+        assert_eq!(args_dest.destination, Some("myserver".to_string()));
+
+        // Neither --config nor destination should fail
+        assert!(CliArgs::try_parse_from(["sshtun"]).is_err());
+
+        // Both --config and destination should fail due to conflict
+        assert!(CliArgs::try_parse_from(["sshtun", "-c", "/etc/sshtun.conf", "myserver"]).is_err());
+    }
+
+    #[test]
+    fn test_parse_config_str_user_example() {
+        let content = r#"
+# Example ssh tunnel configuration
+-N --fwmark 0x100 -R 8500:10.3.5.24:8500 -w auto:10 10.3.1.31
+
+# Second connection with post-up quotes
+-N --fwmark 0x100 -w auto:101 -p 222 --remote-post-up "ip route add 0.0.0.0/1 dev %i; ip route add 128.0.0.0/1 dev %i" 172.24.3.19
+"#;
+        let configs = parse_config_str(content, "test.conf", None).unwrap();
+        assert_eq!(configs.len(), 2);
+
+        // First connection
+        let c1 = &configs[0];
+        assert_eq!(c1.host, "10.3.1.31");
+        assert_eq!(c1.hostname, "10.3.1.31");
+        assert_eq!(c1.port, 22);
+        assert_eq!(c1.fwmark, Some(0x100));
+        assert_eq!(c1.remote_forwards.len(), 1);
+        assert_eq!(c1.remote_forwards[0].bind_port, 8500);
+        assert_eq!(c1.remote_forwards[0].target_host, "10.3.5.24");
+        assert_eq!(c1.remote_forwards[0].target_port, 8500);
+        let tun1 = c1.tun_forward.as_ref().unwrap();
+        assert_eq!(tun1.local_tun, "tun222210");
+        assert_eq!(tun1.remote_tun, "tun222210");
+        assert_eq!(tun1.auto_id, Some(10));
+
+        // Second connection
+        let c2 = &configs[1];
+        assert_eq!(c2.host, "172.24.3.19");
+        assert_eq!(c2.hostname, "172.24.3.19");
+        assert_eq!(c2.port, 222);
+        assert_eq!(c2.fwmark, Some(0x100));
+        assert_eq!(
+            c2.remote_post_up.as_deref(),
+            Some("ip route add 0.0.0.0/1 dev %i; ip route add 128.0.0.0/1 dev %i")
+        );
+        let tun2 = c2.tun_forward.as_ref().unwrap();
+        assert_eq!(tun2.local_tun, "tun2222101");
+        assert_eq!(tun2.remote_tun, "tun2222101");
+        assert_eq!(tun2.auto_id, Some(101));
+    }
+
+    #[test]
+    fn test_parse_config_str_errors() {
+        // Unclosed quotes syntax error
+        let bad_quotes = "-N --remote-post-up \"echo hello 10.0.0.1";
+        let err = parse_config_str(bad_quotes, "test.conf", None).unwrap_err();
+        assert!(err.to_string().contains("test.conf:1: syntax error: unmatched quote"));
+
+        // Unknown argument error
+        let unknown_flag = "--unknown-argument-xyz 10.0.0.1";
+        let err = parse_config_str(unknown_flag, "test.conf", None).unwrap_err();
+        assert!(err.to_string().contains("test.conf:1: failed to parse arguments"));
+
+        // Missing destination
+        let missing_dest = "-N --fwmark 0x100 -w auto:10";
+        let err = parse_config_str(missing_dest, "test.conf", None).unwrap_err();
+        assert!(err.to_string().contains("required arguments were not provided") || err.to_string().contains("missing destination host"));
+
+        // Nested --config
+        let nested_config = "-c other.conf";
+        let err = parse_config_str(nested_config, "test.conf", None).unwrap_err();
+        assert!(err.to_string().contains("test.conf:1: nested --config is not allowed"));
+
+        // Empty file / only comments
+        let empty = "# only comments\n   \n# nothing here";
+        let err = parse_config_str(empty, "test.conf", None).unwrap_err();
+        assert!(err.to_string().contains("test.conf: no valid SSH connection configurations found"));
+
+        // Conflicting local TUN interface names
+        let conflicting_tuns = r#"
+-w auto:10 10.0.0.1
+-w auto:10 10.0.0.2
+"#;
+        let err = parse_config_str(conflicting_tuns, "test.conf", None).unwrap_err();
+        assert!(err.to_string().contains("conflicting local TUN interface 'tun222210'"));
+
+        // Conflicting local forward ports
+        let conflicting_forwards = r#"
+-L 8080:127.0.0.1:80 10.0.0.1
+-L 8080:192.168.1.1:80 10.0.0.2
+"#;
+        let err = parse_config_str(conflicting_forwards, "test.conf", None).unwrap_err();
+        assert!(err.to_string().contains("conflicting local forward bind '127.0.0.1:8080'"));
+    }
+
+    #[test]
+    fn test_from_config_file_tempfile() {
+        let content = r#"
+# sshtun multi-connection config file
+-N -L 8080:127.0.0.1:80 host1
+-N -L 9090:127.0.0.1:90 host2
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{}", content).unwrap();
+
+        let configs = ResolvedConfig::from_config_file(temp_file.path()).unwrap();
+        assert_eq!(configs.len(), 2);
+        assert_eq!(configs[0].host, "host1");
+        assert_eq!(configs[0].local_forwards[0].bind_port, 8080);
+        assert_eq!(configs[1].host, "host2");
+        assert_eq!(configs[1].local_forwards[0].bind_port, 9090);
+
+        // Test non-existent file
+        let non_existent = std::path::Path::new("/non/existent/path/sshtun.conf");
+        let err = ResolvedConfig::from_config_file(non_existent).unwrap_err();
+        assert!(err.to_string().contains("Failed to read config file"));
     }
 }
 
