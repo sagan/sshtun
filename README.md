@@ -9,6 +9,7 @@
 - **Pure Rust SSH Implementation**: Built natively using Tokio and `russh` without invoking the external `ssh` executable.
 - **OpenSSH Configuration & Authentication**:
   - Automatically parses `~/.ssh/config` for host aliases, custom hostnames, ports, users, and identity keys.
+  - Supports `ProxyJump` directive in `~/.ssh/config` (including multi-hop jumps, recursive chained jump hosts, `ssh://` URIs, custom per-host identities, and `ProxyJump none`).
   - Supports SSH public key authentication (`~/.ssh/id_ed25519`, `~/.ssh/id_rsa`, `~/.ssh/id_ecdsa`, `~/.ssh/id_dsa`, or custom `-i` keys).
   - Integrates with `SSH_AUTH_SOCK` (ssh-agent).
 - **Comprehensive Tunnel Support**:
@@ -159,6 +160,35 @@ Avoid routing loops when directing default traffic through the tunnel by assigni
 sudo sshtun root@remote-server -w auto \
   --fwmark 0x1000 \
   --local-post-up "ip rule add not fwmark 0x1000 table 5; ip route add default dev %i table 5"
+```
+
+### 5. Jump Hosts & ProxyJump
+
+Connect through intermediate bastion / jump servers using `~/.ssh/config` or the command-line flag `-J`:
+
+```ssh_config
+# ~/.ssh/config:
+Host bastion
+    HostName 203.0.113.10
+    User jumpuser
+    Port 2200
+    IdentityFile ~/.ssh/bastion_key
+
+Host internal-target
+    HostName 10.0.0.50
+    User appuser
+    ProxyJump bastion
+```
+
+```bash
+# Connect using the ~/.ssh/config ProxyJump directive:
+sshtun internal-target -L 8080:127.0.0.1:80
+
+# Or explicitly specify / override jump hosts on the command line:
+sshtun internal-target -J bastion -L 8080:127.0.0.1:80
+
+# Supports chained multi-hop jump proxies:
+sshtun internal-target -J jump1,jump2:2222
 ```
 
 ---

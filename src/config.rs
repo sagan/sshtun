@@ -655,42 +655,92 @@ fn parse_match_directive(args: &[&str], target_host: &str) -> bool {
     matched
 }
 
-pub fn resolve_host_config(
+pub fn parse_destination_spec(spec: &str, cli_port: Option<u16>) -> (Option<String>, String, Option<u16>) {
+    let mut s = spec.trim();
+    if let Some(stripped) = s.strip_prefix("ssh://") {
+        s = stripped;
+    }
+    s = s.trim_end_matches('/');
+
+    let mut user = None;
+    if let Some(at_idx) = s.find('@') {
+        user = Some(s[..at_idx].to_string());
+        s = &s[at_idx + 1..];
+    }
+
+    let mut port = cli_port;
+    let host = if s.starts_with('[') {
+        if let Some(close_bracket) = s.find(']') {
+            let host_part = &s[1..close_bracket];
+            let after_bracket = &s[close_bracket + 1..];
+            if let Some(p_str) = after_bracket.strip_prefix(':') {
+                if let Ok(p) = p_str.parse::<u16>() {
+                    if port.is_none() {
+                        port = Some(p);
+                    }
+                }
+            }
+            host_part.to_string()
+        } else {
+            s.to_string()
+        }
+    } else if s.matches(':').count() == 1 {
+        let colon_idx = s.rfind(':').unwrap();
+        if let Ok(p) = s[colon_idx + 1..].parse::<u16>() {
+            if port.is_none() {
+                port = Some(p);
+            }
+            s[..colon_idx].to_string()
+        } else {
+            s.to_string()
+        }
+    } else {
+        s.to_string()
+    };
+
+    (user, host, port)
+}
+
+pub fn parse_proxy_jump_values(val: &str) -> Vec<String> {
+    let trimmed = val.trim().trim_matches('"').trim_matches('\'');
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+        return Vec::new();
+    }
+    let mut results = Vec::new();
+    for comma_part in trimmed.split(',') {
+        for token in comma_part.split_whitespace() {
+            let t = token.trim().trim_matches('"').trim_matches('\'');
+            if !t.is_empty() && !t.eq_ignore_ascii_case("none") {
+                results.push(t.to_string());
+            }
+        }
+    }
+    results
+}
+
+pub fn resolve_host_config_full(
     spec: &str,
     cli_port: Option<u16>,
     cli_identities: &[PathBuf],
-) -> Result<HostConnectionConfig> {
-    let mut target_user = None;
-    let mut target_host = spec.to_string();
-    let mut target_port = cli_port;
-
-    if let Some(at_idx) = target_host.find('@') {
-        target_user = Some(target_host[..at_idx].to_string());
-        target_host = target_host[at_idx + 1..].to_string();
-    }
-
-    if let Some(colon_idx) = target_host.rfind(':') {
-        if let Ok(p) = target_host[colon_idx + 1..].parse::<u16>() {
-            if target_port.is_none() {
-                target_port = Some(p);
-            }
-            target_host = target_host[..colon_idx].to_string();
-        }
-    }
+    config_path: Option<&std::path::Path>,
+) -> Result<(HostConnectionConfig, ExtractedSshConfig)> {
+    let (target_user, target_host, target_port) = parse_destination_spec(spec, cli_port);
 
     let home_dir = dirs::home_dir();
     let mut extracted = ExtractedSshConfig::default();
 
-    if let Some(ref home) = home_dir {
-        let ssh_config_path = home.join(".ssh").join("config");
+    let default_config_path = home_dir.as_ref().map(|h| h.join(".ssh").join("config"));
+    let ssh_config_path = config_path.or(default_config_path.as_deref());
+
+    if let Some(path) = ssh_config_path {
         let mut visited = std::collections::HashSet::new();
-        parse_ssh_config_file_rec(&ssh_config_path, &target_host, &mut extracted, &mut visited);
+        parse_ssh_config_file_rec(path, &target_host, &mut extracted, &mut visited);
     }
 
-    let hostname = extracted.hostname.unwrap_or_else(|| target_host.clone());
+    let hostname = extracted.hostname.clone().unwrap_or_else(|| target_host.clone());
 
     let user = target_user
-        .or(extracted.user)
+        .or(extracted.user.clone())
         .unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "root".to_string()));
 
     let port = target_port.or(extracted.port).unwrap_or(22);
@@ -731,55 +781,107 @@ pub fn resolve_host_config(
         }
     }
 
-    Ok(HostConnectionConfig {
-        host: target_host,
-        hostname,
-        port,
-        user,
-        identity_files,
-    })
+    Ok((
+        HostConnectionConfig {
+            host: target_host,
+            hostname,
+            port,
+            user,
+            identity_files,
+        },
+        extracted,
+    ))
+}
+
+#[allow(dead_code)]
+pub fn resolve_host_config(
+    spec: &str,
+    cli_port: Option<u16>,
+    cli_identities: &[PathBuf],
+) -> Result<HostConnectionConfig> {
+    resolve_host_config_full(spec, cli_port, cli_identities, None).map(|(host, _)| host)
+}
+
+fn resolve_jump_host_chain(
+    specs: &[String],
+    config_path: Option<&std::path::Path>,
+    visited_hosts: &mut std::collections::HashSet<String>,
+    depth: usize,
+) -> Result<Vec<HostConnectionConfig>> {
+    if depth > 16 {
+        return Err(anyhow!("ProxyJump loop or maximum jump limit exceeded"));
+    }
+
+    let mut jump_hosts = Vec::new();
+
+    for spec in specs {
+        let (_, host_name, _) = parse_destination_spec(spec, None);
+        if visited_hosts.contains(&host_name) {
+            return Err(anyhow!("ProxyJump loop detected involving host: {}", host_name));
+        }
+
+        visited_hosts.insert(host_name.clone());
+
+        let (jump_conn, jump_extracted) = resolve_host_config_full(spec, None, &[], config_path)?;
+
+        if jump_conn.hostname != host_name && visited_hosts.contains(&jump_conn.hostname) {
+            return Err(anyhow!("ProxyJump loop detected involving host: {}", jump_conn.hostname));
+        }
+        if jump_conn.hostname != host_name {
+            visited_hosts.insert(jump_conn.hostname.clone());
+        }
+
+        // If this jump host also specifies ProxyJump in ssh config, recursively resolve it first!
+        if let Some(ref pj) = jump_extracted.proxy_jump {
+            let recursive_specs = parse_proxy_jump_values(pj);
+            if !recursive_specs.is_empty() {
+                let sub_chain = resolve_jump_host_chain(&recursive_specs, config_path, visited_hosts, depth + 1)?;
+                jump_hosts.extend(sub_chain);
+            }
+        }
+
+        jump_hosts.push(jump_conn);
+    }
+
+    Ok(jump_hosts)
 }
 
 impl ResolvedConfig {
     pub fn from_args(args: CliArgs) -> Result<Self> {
-        let target_config = resolve_host_config(&args.destination, args.port, &args.identity)?;
+        Self::from_args_with_config_path(args, None)
+    }
 
-        let home_dir = dirs::home_dir();
-        let mut extracted = ExtractedSshConfig::default();
-        if let Some(ref home) = home_dir {
-            let ssh_config_path = home.join(".ssh").join("config");
-            let mut visited = std::collections::HashSet::new();
-            parse_ssh_config_file_rec(&ssh_config_path, &target_config.host, &mut extracted, &mut visited);
-        }
+    pub fn from_args_with_config_path(args: CliArgs, config_path: Option<&std::path::Path>) -> Result<Self> {
+        let (target_config, extracted) = resolve_host_config_full(
+            &args.destination,
+            args.port,
+            &args.identity,
+            config_path,
+        )?;
 
         // Determine jump hosts
         let mut jump_specs = Vec::new();
-        if !args.jump_hosts.is_empty() {
+        let is_cli_none = args.jump_hosts.len() == 1 && args.jump_hosts[0].trim().eq_ignore_ascii_case("none");
+
+        if is_cli_none {
+            // Explicitly disabled via CLI flag -J none
+        } else if !args.jump_hosts.is_empty() {
             for j in &args.jump_hosts {
-                for s in j.split(',') {
-                    let trimmed = s.trim();
-                    if !trimmed.is_empty() {
-                        jump_specs.push(trimmed.to_string());
-                    }
-                }
+                let parsed = parse_proxy_jump_values(j);
+                jump_specs.extend(parsed);
             }
         } else if let Some(ref proxy_jump) = extracted.proxy_jump {
-            if proxy_jump.trim().to_lowercase() != "none" {
-                for s in proxy_jump.split(',') {
-                    for token in s.split_whitespace() {
-                        let trimmed = token.trim();
-                        if !trimmed.is_empty() && trimmed.to_lowercase() != "none" {
-                            jump_specs.push(trimmed.to_string());
-                        }
-                    }
-                }
-            }
+            let parsed = parse_proxy_jump_values(proxy_jump);
+            jump_specs.extend(parsed);
         }
 
-        let mut jump_hosts = Vec::new();
-        for spec in jump_specs {
-            jump_hosts.push(resolve_host_config(&spec, None, &args.identity)?);
+        let mut visited_hosts = std::collections::HashSet::new();
+        visited_hosts.insert(target_config.host.clone());
+        if target_config.hostname != target_config.host {
+            visited_hosts.insert(target_config.hostname.clone());
         }
+
+        let jump_hosts = resolve_jump_host_chain(&jump_specs, config_path, &mut visited_hosts, 0)?;
 
         // Merge local forwards (config first, then CLI flags)
         let mut local_forwards = Vec::new();
@@ -1263,6 +1365,247 @@ Host myserver
         let resolved = ResolvedConfig::from_args(args).unwrap();
         assert_eq!(resolved.local_tun_addr6, Some("fd00:1234::1".to_string()));
         assert_eq!(resolved.remote_tun_addr6, Some("fd00:1234::2".to_string()));
+    }
+
+    #[test]
+    fn test_parse_destination_spec() {
+        // Basic hostname
+        let (u, h, p) = parse_destination_spec("myserver", None);
+        assert_eq!(u, None);
+        assert_eq!(h, "myserver");
+        assert_eq!(p, None);
+
+        // User and hostname
+        let (u, h, p) = parse_destination_spec("alice@myserver", None);
+        assert_eq!(u, Some("alice".to_string()));
+        assert_eq!(h, "myserver");
+        assert_eq!(p, None);
+
+        // User, hostname, and port
+        let (u, h, p) = parse_destination_spec("alice@myserver:2222", None);
+        assert_eq!(u, Some("alice".to_string()));
+        assert_eq!(h, "myserver");
+        assert_eq!(p, Some(2222));
+
+        // CLI port override takes precedence over spec port
+        let (u, h, p) = parse_destination_spec("alice@myserver:2222", Some(3333));
+        assert_eq!(u, Some("alice".to_string()));
+        assert_eq!(h, "myserver");
+        assert_eq!(p, Some(3333));
+
+        // ssh:// URI scheme
+        let (u, h, p) = parse_destination_spec("ssh://myserver", None);
+        assert_eq!(u, None);
+        assert_eq!(h, "myserver");
+        assert_eq!(p, None);
+
+        let (u, h, p) = parse_destination_spec("ssh://alice@myserver:2222/", None);
+        assert_eq!(u, Some("alice".to_string()));
+        assert_eq!(h, "myserver");
+        assert_eq!(p, Some(2222));
+
+        // Bracketed IPv6
+        let (u, h, p) = parse_destination_spec("[2001:db8::1]:2222", None);
+        assert_eq!(u, None);
+        assert_eq!(h, "2001:db8::1");
+        assert_eq!(p, Some(2222));
+
+        let (u, h, p) = parse_destination_spec("user@[2001:db8::1]:2222", None);
+        assert_eq!(u, Some("user".to_string()));
+        assert_eq!(h, "2001:db8::1");
+        assert_eq!(p, Some(2222));
+
+        let (u, h, p) = parse_destination_spec("[2001:db8::1]", None);
+        assert_eq!(u, None);
+        assert_eq!(h, "2001:db8::1");
+        assert_eq!(p, None);
+
+        // Unbracketed IPv6
+        let (u, h, p) = parse_destination_spec("2001:db8::1", None);
+        assert_eq!(u, None);
+        assert_eq!(h, "2001:db8::1");
+        assert_eq!(p, None);
+    }
+
+    #[test]
+    fn test_parse_proxy_jump_values() {
+        assert_eq!(parse_proxy_jump_values("jump1"), vec!["jump1"]);
+        assert_eq!(parse_proxy_jump_values("jump1,jump2"), vec!["jump1", "jump2"]);
+        assert_eq!(parse_proxy_jump_values("jump1, jump2, jump3"), vec!["jump1", "jump2", "jump3"]);
+        assert_eq!(parse_proxy_jump_values("jump1 jump2"), vec!["jump1", "jump2"]);
+        assert_eq!(parse_proxy_jump_values("\"jump1, jump2\""), vec!["jump1", "jump2"]);
+        assert_eq!(parse_proxy_jump_values("none"), Vec::<String>::new());
+        assert_eq!(parse_proxy_jump_values("NONE"), Vec::<String>::new());
+        assert_eq!(parse_proxy_jump_values("\"none\""), Vec::<String>::new());
+        assert_eq!(parse_proxy_jump_values(""), Vec::<String>::new());
+        assert_eq!(
+            parse_proxy_jump_values("ssh://user@jump1:2222, jump2"),
+            vec!["ssh://user@jump1:2222", "jump2"]
+        );
+    }
+
+    #[test]
+    fn test_proxy_jump_single_and_multi_hop_from_config() {
+        let config_text = r#"
+Host jump1
+    HostName 192.168.1.101
+    User jumpuser1
+    Port 2201
+
+Host jump2
+    HostName 192.168.1.102
+    User jumpuser2
+    Port 2202
+
+Host target
+    HostName 10.0.0.50
+    User targetuser
+    Port 22
+    ProxyJump jump1, jump2
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{}", config_text).unwrap();
+
+        let args = CliArgs::try_parse_from(["sshtun", "target"]).unwrap();
+        let resolved = ResolvedConfig::from_args_with_config_path(args, Some(temp_file.path())).unwrap();
+
+        assert_eq!(resolved.host, "target");
+        assert_eq!(resolved.hostname, "10.0.0.50");
+        assert_eq!(resolved.user, "targetuser");
+        assert_eq!(resolved.port, 22);
+        assert_eq!(resolved.jump_hosts.len(), 2);
+
+        assert_eq!(resolved.jump_hosts[0].host, "jump1");
+        assert_eq!(resolved.jump_hosts[0].hostname, "192.168.1.101");
+        assert_eq!(resolved.jump_hosts[0].user, "jumpuser1");
+        assert_eq!(resolved.jump_hosts[0].port, 2201);
+
+        assert_eq!(resolved.jump_hosts[1].host, "jump2");
+        assert_eq!(resolved.jump_hosts[1].hostname, "192.168.1.102");
+        assert_eq!(resolved.jump_hosts[1].user, "jumpuser2");
+        assert_eq!(resolved.jump_hosts[1].port, 2202);
+    }
+
+    #[test]
+    fn test_proxy_jump_chained_recursive() {
+        let config_text = r#"
+Host jump-first
+    HostName 203.0.113.1
+    User user1
+    Port 2221
+
+Host jump-second
+    HostName 10.1.0.1
+    User user2
+    Port 2222
+    ProxyJump jump-first
+
+Host target
+    HostName 10.2.0.1
+    User targetuser
+    ProxyJump jump-second
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{}", config_text).unwrap();
+
+        let args = CliArgs::try_parse_from(["sshtun", "target"]).unwrap();
+        let resolved = ResolvedConfig::from_args_with_config_path(args, Some(temp_file.path())).unwrap();
+
+        assert_eq!(resolved.jump_hosts.len(), 2);
+        // jump-first must come before jump-second in the connection chain
+        assert_eq!(resolved.jump_hosts[0].host, "jump-first");
+        assert_eq!(resolved.jump_hosts[0].hostname, "203.0.113.1");
+        assert_eq!(resolved.jump_hosts[0].port, 2221);
+
+        assert_eq!(resolved.jump_hosts[1].host, "jump-second");
+        assert_eq!(resolved.jump_hosts[1].hostname, "10.1.0.1");
+        assert_eq!(resolved.jump_hosts[1].port, 2222);
+    }
+
+    #[test]
+    fn test_proxy_jump_loop_detection() {
+        // Direct self-loop
+        let self_loop_config = r#"
+Host loophost
+    HostName 1.2.3.4
+    ProxyJump loophost
+"#;
+        let mut file1 = NamedTempFile::new().unwrap();
+        write!(file1, "{}", self_loop_config).unwrap();
+
+        let args1 = CliArgs::try_parse_from(["sshtun", "loophost"]).unwrap();
+        let res1 = ResolvedConfig::from_args_with_config_path(args1, Some(file1.path()));
+        assert!(res1.is_err());
+        assert!(res1.unwrap_err().to_string().contains("ProxyJump loop detected"));
+
+        // Indirect cycle: A -> B -> A
+        let cycle_config = r#"
+Host hostA
+    HostName 1.1.1.1
+    ProxyJump hostB
+
+Host hostB
+    HostName 2.2.2.2
+    ProxyJump hostA
+"#;
+        let mut file2 = NamedTempFile::new().unwrap();
+        write!(file2, "{}", cycle_config).unwrap();
+
+        let args2 = CliArgs::try_parse_from(["sshtun", "hostA"]).unwrap();
+        let res2 = ResolvedConfig::from_args_with_config_path(args2, Some(file2.path()));
+        assert!(res2.is_err());
+        assert!(res2.unwrap_err().to_string().contains("ProxyJump loop detected"));
+    }
+
+    #[test]
+    fn test_proxy_jump_overrides_and_identities() {
+        let jump_key_file = NamedTempFile::new().unwrap();
+        let target_key_file = NamedTempFile::new().unwrap();
+
+        let config_text = format!(
+            r#"
+Host jump-configured
+    HostName 192.168.1.10
+    User jumpuser
+    Port 2200
+    IdentityFile {}
+
+Host target-with-none
+    HostName 10.0.0.1
+    ProxyJump none
+
+Host target-with-jump
+    HostName 10.0.0.2
+    ProxyJump jump-configured
+"#,
+            jump_key_file.path().display()
+        );
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{}", config_text).unwrap();
+
+        // 1. ProxyJump none in config yields no jump hosts
+        let args_none = CliArgs::try_parse_from(["sshtun", "target-with-none"]).unwrap();
+        let res_none = ResolvedConfig::from_args_with_config_path(args_none, Some(temp_file.path())).unwrap();
+        assert!(res_none.jump_hosts.is_empty());
+
+        // 2. CLI -J none overrides config ProxyJump
+        let args_cli_none = CliArgs::try_parse_from(["sshtun", "target-with-jump", "-J", "none"]).unwrap();
+        let res_cli_none = ResolvedConfig::from_args_with_config_path(args_cli_none, Some(temp_file.path())).unwrap();
+        assert!(res_cli_none.jump_hosts.is_empty());
+
+        // 3. CLI -J override changes jump host
+        let args_cli_override = CliArgs::try_parse_from(["sshtun", "target-with-jump", "-J", "custom-jump.example.com:2222"]).unwrap();
+        let res_cli_override = ResolvedConfig::from_args_with_config_path(args_cli_override, Some(temp_file.path())).unwrap();
+        assert_eq!(res_cli_override.jump_hosts.len(), 1);
+        assert_eq!(res_cli_override.jump_hosts[0].host, "custom-jump.example.com");
+        assert_eq!(res_cli_override.jump_hosts[0].port, 2222);
+
+        // 4. CLI -i for target does NOT overwrite jump host's configured IdentityFile
+        let args_target_key = CliArgs::try_parse_from(["sshtun", "target-with-jump", "-i", target_key_file.path().to_str().unwrap()]).unwrap();
+        let res_target_key = ResolvedConfig::from_args_with_config_path(args_target_key, Some(temp_file.path())).unwrap();
+        assert_eq!(res_target_key.identity_files, vec![target_key_file.path().to_path_buf()]);
+        assert_eq!(res_target_key.jump_hosts.len(), 1);
+        assert_eq!(res_target_key.jump_hosts[0].identity_files, vec![jump_key_file.path().to_path_buf()]);
     }
 
     #[test]
