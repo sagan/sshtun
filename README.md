@@ -17,7 +17,7 @@
   - **Dynamic SOCKS5 Proxy (`-D`)**: `[bind_address:]port`
   - **TUN Interface Tunneling (`-w`)**: `local_tun[:remote_tun]` (e.g. `0:0`, `any:any`, `tun0:tun1`), or `-w auto` / `-w auto:<id>` for zero-configuration automatic TUN setup.
 - **Automated TUN Device & Network Setup**:
-  - Automatically provisions TUN interfaces `tun2222<id>` with `-w auto` (or `-w auto:<id>`) with derived or assigned `<id>` and link-local IP addresses, configuring server nftables firewall and routing out of the box.
+  - Automatically provisions TUN interfaces `tun2222<id>` with `-w auto` (or `-w auto:<id>`) with derived or assigned `<id>` and link-local IP addresses, configuring server nftables (or iptables via `--use-iptables` for older Linux servers) firewall and routing out of the box.
   - Configures point-to-point /32 IP address pairs on local TUN interfaces via `--local-tun-addr` and `--remote-tun-addr`.
   - Supports `--local-post-up <cmdline>` and `--remote-post-up <cmdline>` hook scripts with `%i` interface name placeholder (e.g. `ip route add ... dev %i`) for custom routing and firewall rules.
 - **Netfilter fwmark Support**:
@@ -67,8 +67,10 @@ Options:
           Remote port forwarding: [bind_address:]port:host:hostport
   -D, --dynamic-forward <DYNAMIC_FORWARDS>
           Dynamic SOCKS5 port forwarding: [bind_address:]port
-  -w, --tun-forward <TUN_FORWARD>
-          TUN device tunnel: local_tun[:remote_tun] (e.g. 0:0, any:any, tun0:tun1)
+  -w, --tun-forward [<TUN_FORWARD>]
+          TUN device tunnel: local_tun[:remote_tun] (e.g. 0:0, any:any, tun0:tun1) or "auto" / "auto:<id>"
+  -J, --jump-host <JUMP_HOSTS>
+          Jump host(s): [user@]host[:port][,...]
       --local-tun-addr <LOCAL_TUN_ADDR>
           Local TUN IP address (e.g. 192.168.100.1 or 192.168.100.1/32)
       --remote-tun-addr <REMOTE_TUN_ADDR>
@@ -91,6 +93,8 @@ Options:
           Max failed keepalive pings before declaring link dead [default: 3]
       --fwmark <FWMARK>
           Netfilter fwmark for created SSH socket (e.g. 0x1000 or 4096)
+      --use-iptables
+          Use iptables instead of nftables for remote server firewall rules
   -v, --verbose...
           Verbose logging output
   -h, --help
@@ -126,6 +130,10 @@ With `-w auto` (or `-w auto:<id>`, e.g. `-w auto:1024`), `sshtun` automatically 
 ```bash
 # Auto-generate ID & dual-stack IPv4/IPv6 IPs, creating tun2222<id>
 sudo sshtun root@remote-server -w \
+  --local-post-up "ip route add 10.3.1.0/24 dev %i table 5"
+
+# On older Linux servers without nftables, use iptables:
+sudo sshtun root@remote-server -w --use-iptables \
   --local-post-up "ip route add 10.3.1.0/24 dev %i table 5"
 
 # Or manually set ID (creates tun22221024 with 169.254.4.0 <-> 169.254.4.1 and fd..:0 <-> fd..:1):

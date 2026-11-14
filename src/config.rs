@@ -83,6 +83,10 @@ pub struct CliArgs {
     #[arg(long = "fwmark", alias = "mark", value_parser = parse_fwmark)]
     pub fwmark: Option<u32>,
 
+    /// Use iptables instead of nftables for remote server firewall rules
+    #[arg(long = "use-iptables")]
+    pub use_iptables: bool,
+
     /// Verbose logging output
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
     pub verbose: u8,
@@ -148,6 +152,7 @@ pub struct ResolvedConfig {
     pub keepalive_interval: u64,
     pub keepalive_max: u32,
     pub fwmark: Option<u32>,
+    pub use_iptables: bool,
 }
 
 pub fn parse_fwmark(s: &str) -> std::result::Result<u32, String> {
@@ -879,6 +884,7 @@ impl ResolvedConfig {
             keepalive_interval: args.keepalive_interval,
             keepalive_max: args.keepalive_max,
             fwmark: args.fwmark,
+            use_iptables: args.use_iptables,
         })
     }
 }
@@ -1257,6 +1263,19 @@ Host myserver
         let resolved = ResolvedConfig::from_args(args).unwrap();
         assert_eq!(resolved.local_tun_addr6, Some("fd00:1234::1".to_string()));
         assert_eq!(resolved.remote_tun_addr6, Some("fd00:1234::2".to_string()));
+    }
+
+    #[test]
+    fn test_cli_args_use_iptables() {
+        let args_default = CliArgs::try_parse_from(["sshtun", "myserver"]).unwrap();
+        assert!(!args_default.use_iptables);
+        let resolved_default = ResolvedConfig::from_args(args_default).unwrap();
+        assert!(!resolved_default.use_iptables);
+
+        let args_iptables = CliArgs::try_parse_from(["sshtun", "myserver", "--use-iptables"]).unwrap();
+        assert!(args_iptables.use_iptables);
+        let resolved_iptables = ResolvedConfig::from_args(args_iptables).unwrap();
+        assert!(resolved_iptables.use_iptables);
     }
 }
 
